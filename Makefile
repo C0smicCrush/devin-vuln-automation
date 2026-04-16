@@ -1,6 +1,6 @@
 PYTHON ?= python3
 
-.PHONY: simulate discover issues launch poll report
+.PHONY: simulate discover issues launch poll report deploy-aws test invoke-manual invoke-linear
 
 simulate: discover issues poll report
 
@@ -19,3 +19,15 @@ poll:
 
 report:
 	$(PYTHON) scripts/render_metrics.py
+
+deploy-aws:
+	bash infra/deploy_aws.sh
+
+test:
+	$(PYTHON) -m unittest discover -s tests -p "test_*.py"
+
+invoke-manual:
+	curl -sS -X POST "$$INTAKE_URL/manual" -H "Content-Type: application/json" --data @fixtures/manual.sample.json
+
+invoke-linear:
+	curl -sS -X POST "$$INTAKE_URL/linear" -H "Content-Type: application/json" --data @fixtures/linear.sample.json

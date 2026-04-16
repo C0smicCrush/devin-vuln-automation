@@ -1,0 +1,47 @@
+{
+  "tiers": {
+    "tier0_auto_dependency_patch": {
+      "automation_decision": "auto",
+      "description": "Direct or tightly bounded dependency remediation with high confidence and existing validation coverage.",
+      "commands": [
+        "npm audit --package-lock-only",
+        "npm run test -- --runInBand"
+      ],
+      "manual_checks": [],
+      "requires_new_tests": false
+    },
+    "tier1_auto_targeted_runtime": {
+      "automation_decision": "auto",
+      "description": "Runtime-impacting remediation that still has a bounded surface and a credible targeted validation path.",
+      "commands": [
+        "npm run test -- --runInBand",
+        "npm run build"
+      ],
+      "manual_checks": [
+        "Review impacted feature area in PR summary."
+      ],
+      "requires_new_tests": true
+    },
+    "tier2_manual_review": {
+      "automation_decision": "manual_approval",
+      "description": "Broader runtime or transitive dependency change that may require human review before execution.",
+      "commands": [
+        "npm run build"
+      ],
+      "manual_checks": [
+        "Review dependency release notes.",
+        "Confirm remediation scope before merge."
+      ],
+      "requires_new_tests": true
+    },
+    "tier3_manual_hold": {
+      "automation_decision": "manual_approval",
+      "description": "High-risk or low-confidence work item where the system should stop after scoping and request human direction.",
+      "commands": [],
+      "manual_checks": [
+        "Manual triage required before remediation."
+      ],
+      "requires_new_tests": false
+    }
+  }
+}

@@ -23,7 +23,7 @@ def normalize_finding(raw: dict) -> dict:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Load deterministic security findings for the demo flow.")
+    parser = argparse.ArgumentParser(description="Load deterministic scanner findings for the demo flow.")
     parser.add_argument(
         "--fixture",
         default=str(FIXTURES_DIR / "findings.sample.json"),

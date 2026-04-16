@@ -1,4 +1,4 @@
-name: Discover Vulnerabilities
+name: Ingest Security Findings
 
 on:
   workflow_dispatch:
@@ -26,19 +26,19 @@ jobs:
       - name: Normalize findings
         run: python scripts/scan_or_import_findings.py
 
-      - name: Create remediation issues
+      - name: Create GitHub work items
         run: python scripts/create_issues.py
 
       - name: Render workflow summary
         run: |
-          echo "## Discovery run" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Finding ingestion run" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
           import json
           from pathlib import Path
           payload = json.loads(Path("state/issues.json").read_text())
           print(f"- Findings processed: `{payload['count']}`")
-          print(f"- Issues created this run: `{payload['created_count']}`")
+          print(f"- Work items created this run: `{payload['created_count']}`")
           for item in payload["issues"]:
               print(f"- Issue #{item['issue_number']}: {item['issue_title']}")
           PY

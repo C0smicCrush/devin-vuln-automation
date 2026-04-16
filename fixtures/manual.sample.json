@@ -1,0 +1,10 @@
+{
+  "id": "manual-dompurify-sample",
+  "title": "Resolve DOMPurify vulnerability in Superset frontend",
+  "body": "npm audit reported a moderate DOMPurify advisory in superset-frontend/package-lock.json. Determine scope, testing, and whether this can be auto-remediated.",
+  "labels": [
+    "security-remediation",
+    "manual-source"
+  ],
+  "canonical_issue_number": 67
+}

@@ -19,7 +19,7 @@ from common import (
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Create remediation issues from normalized findings.")
+    parser = argparse.ArgumentParser(description="Create GitHub work items from normalized scanner findings.")
     parser.add_argument("--input", default=str(ROOT / "state" / "findings.json"))
     parser.add_argument("--output", default=str(ROOT / "state" / "issues.json"))
     return parser.parse_args()
@@ -50,9 +50,9 @@ def ensure_labels(owner: str, repo: str, token: str, labels: list[str]) -> None:
     existing = github_request("GET", f"/repos/{owner}/{repo}/labels", token=token, query={"per_page": "100"})
     existing_names = {item["name"] for item in existing}
     palette = {
-        "security-remediation": ("d73a4a", "Security remediation work item"),
+        "security-remediation": ("d73a4a", "Scanner-derived security work item"),
         "devin-candidate": ("5319e7", "Eligible for Devin automation"),
-        "devin-remediate": ("0e8a16", "Trigger Devin remediation workflow"),
+        "devin-remediate": ("0e8a16", "Trigger Devin remediation from this finding"),
     }
     for label in labels:
         if label in existing_names:

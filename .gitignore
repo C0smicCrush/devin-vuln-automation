@@ -5,3 +5,6 @@ metrics/latest.json
 metrics/summary.md
 state/*.json
 !.gitkeep
+build/
+dist/
+*.zip

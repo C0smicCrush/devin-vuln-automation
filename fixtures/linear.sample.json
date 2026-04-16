@@ -1,0 +1,11 @@
+{
+  "id": "linear-dompurify-sample",
+  "action": "created",
+  "title": "Remediate DOMPurify vulnerability from audit feed",
+  "description": "Scanner output indicates the frontend lockfile resolves a vulnerable DOMPurify version. Scope the change and determine the correct validation plan before remediation.",
+  "labels": [
+    "security-remediation",
+    "linear-source"
+  ],
+  "url": "https://linear.app/example/issue/SEC-123"
+}
