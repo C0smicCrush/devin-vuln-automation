@@ -1,0 +1,67 @@
+name: Launch Devin Remediation
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Issue number in the target Superset repo"
+        required: true
+        type: string
+  repository_dispatch:
+    types:
+      - superset_remediation_requested
+
+jobs:
+  remediate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ secrets.GH_TOKEN }}
+      DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
+      DEVIN_ORG_ID: ${{ secrets.DEVIN_ORG_ID }}
+      TARGET_REPO_OWNER: C0smicCrush
+      TARGET_REPO_NAME: superset-remediation
+      DEVIN_BYPASS_APPROVAL: "false"
+    steps:
+      - name: Check out automation repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Resolve issue number
+        id: issue
+        run: |
+          ISSUE_NUMBER="${{ inputs.issue_number || github.event.client_payload.issue_number }}"
+          if [ -z "$ISSUE_NUMBER" ]; then
+            echo "Missing issue number" >&2
+            exit 1
+          fi
+          echo "issue_number=$ISSUE_NUMBER" >> "$GITHUB_OUTPUT"
+
+      - name: Launch Devin session
+        run: python scripts/launch_devin_session.py --issue-number "${{ steps.issue.outputs.issue_number }}"
+
+      - name: Render workflow summary
+        run: |
+          echo "## Devin launch" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          from pathlib import Path
+          payload = json.loads(Path("state/sessions.json").read_text())
+          session = payload["sessions"][-1]
+          print(f"- Issue: `#{session['issue_number']}`")
+          print(f"- Session ID: `{session['session_id']}`")
+          print(f"- Status: `{session['status']}`")
+          print(f"- Session URL: {session['session_url']}")
+          PY
+
+      - name: Upload session state
+        uses: actions/upload-artifact@v4
+        with:
+          name: remediation-session-state
+          path: state/sessions.json

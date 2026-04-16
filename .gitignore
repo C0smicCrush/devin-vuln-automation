@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.DS_Store
+metrics/latest.json
+metrics/summary.md
+state/*.json
+!.gitkeep

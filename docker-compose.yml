@@ -1,0 +1,16 @@
+services:
+  controller:
+    build:
+      context: .
+    image: devin-vuln-automation:local
+    working_dir: /app
+    environment:
+      GH_TOKEN: ${GH_TOKEN:-}
+      DEVIN_API_KEY: ${DEVIN_API_KEY:-}
+      DEVIN_ORG_ID: ${DEVIN_ORG_ID:-}
+      TARGET_REPO_OWNER: ${TARGET_REPO_OWNER:-C0smicCrush}
+      TARGET_REPO_NAME: ${TARGET_REPO_NAME:-superset-remediation}
+      DEVIN_BYPASS_APPROVAL: ${DEVIN_BYPASS_APPROVAL:-false}
+    volumes:
+      - .:/app
+    command: python scripts/scan_or_import_findings.py
