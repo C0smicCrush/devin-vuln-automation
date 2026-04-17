@@ -13,4 +13,4 @@ services:
       DEVIN_BYPASS_APPROVAL: ${DEVIN_BYPASS_APPROVAL:-false}
     volumes:
       - .:/app
-    command: python scripts/scan_or_import_findings.py
+    command: python -m unittest discover -s tests -p test_*.py

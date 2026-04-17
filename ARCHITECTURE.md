@@ -364,8 +364,6 @@ Deployed or intended resources:
 
 AWS is responsible for transport, policy, and observability. It should not become the engineering decision-maker.
 
-There are also optional GitHub Actions helper workflows in the automation repo for deterministic scanner-fixture ingestion, direct issue-based remediation launch, and local-style observability rendering. Those workflows are secondary helpers, not the primary hosted control plane.
-
 ### GitHub
 
 GitHub is the human-visible work surface.

@@ -13,4 +13,4 @@ COPY . /app
 
 RUN mkdir -p /app/state /app/metrics
 
-CMD ["python", "scripts/scan_or_import_findings.py"]
+CMD ["python", "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py"]

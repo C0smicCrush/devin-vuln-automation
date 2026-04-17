@@ -375,13 +375,10 @@ Notes:
 │   └── deploy_aws.sh
 ├── scripts/
 │   ├── common.py
-│   ├── create_issues.py
-│   ├── launch_devin_session.py
-│   ├── poll_devin_sessions.py
-│   ├── render_metrics.py
-│   ├── run_devin_discovery.py
-│   └── scan_or_import_findings.py
+│   └── run_devin_discovery.py
 ├── fixtures/
+│   ├── linear.sample.json
+│   └── manual.sample.json
 ├── state/
 ├── metrics/
 ├── requirements.txt
@@ -434,7 +431,7 @@ Build the local container environment:
 docker compose build
 ```
 
-The default `docker compose` command is intentionally small: it runs the deterministic scanner-fixture ingestion path, not a full local Lambda stack.
+The default `docker compose` command runs the unit test suite inside the container. It is not a full local Lambda stack.
 
 Run unit tests:
 
@@ -449,26 +446,6 @@ export INTAKE_URL="<lambda-url>"
 make invoke-manual
 make invoke-linear
 ```
-
-Legacy replay flows still exist for deterministic local simulation:
-
-```bash
-make discover
-make issues
-make launch ISSUE_NUMBER=1
-make poll
-make report
-```
-
-## Optional GitHub Actions
-
-The repo still contains GitHub Actions workflows in `.github/workflows/` for older or local/CI-style flows:
-
-- `discover.yml` runs the deterministic scanner-fixture -> issue path
-- `remediate.yml` launches a Devin remediation session directly for a chosen issue
-- `observe.yml` polls sessions and renders local metrics artifacts
-
-These workflows are not the primary hosted control plane. The main deployed path is AWS-based.
 
 ## Observability
 
