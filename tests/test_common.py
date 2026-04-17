@@ -3,11 +3,14 @@ from __future__ import annotations
 import unittest
 
 from scripts.common import (
+    build_discovery_prompt,
     build_remediation_prompt_from_work_item,
     canonical_issue_body_from_work_item,
     derive_family_key,
+    discovery_output_schema,
     load_test_tier_matrix,
     seed_work_item_from_raw,
+    session_output_schema,
     should_run_preflight,
 )
 
@@ -68,6 +71,9 @@ class CommonPromptTests(unittest.TestCase):
         self.assertIn("Frontend runtime behavior", prompt)
         self.assertIn("end-to-end remediation operator", prompt)
         self.assertIn("Investigate whether the issue is actionable", prompt)
+        self.assertIn("scanner_before", prompt)
+        self.assertIn("scanner_after", prompt)
+        self.assertIn("one bounded PR per advisory or CVE", prompt)
 
     def test_family_key_prefers_finding_label(self) -> None:
         family = derive_family_key("Anything", ["finding:dompurify-001", "security-remediation"])
@@ -102,6 +108,32 @@ class CommonPromptTests(unittest.TestCase):
             "labels": [],
         }
         self.assertTrue(should_run_preflight(raw))
+
+    def test_session_schema_includes_validation_receipts(self) -> None:
+        schema = session_output_schema()
+        props = schema["properties"]
+        for key in ("scanner_before", "scanner_after", "tests", "pr_url", "residual_risk"):
+            self.assertIn(key, props)
+        self.assertEqual(schema["properties"]["tests"]["type"], "array")
+
+    def test_discovery_prompt_requires_rejected_findings(self) -> None:
+        prompt = build_discovery_prompt(
+            "C0smicCrush",
+            "superset-remediation",
+            "https://github.com/C0smicCrush/superset-remediation",
+            1,
+        )
+        self.assertIn("rejected_findings", prompt)
+        self.assertIn("one advisory or CVE per finding", prompt)
+
+    def test_discovery_schema_supports_rejected_findings(self) -> None:
+        schema = discovery_output_schema()
+        props = schema["properties"]
+        self.assertIn("rejected_findings", props)
+        self.assertEqual(props["rejected_findings"]["type"], "array")
+        required_item_keys = schema["properties"]["rejected_findings"]["items"]["required"]
+        self.assertIn("title", required_item_keys)
+        self.assertIn("reason", required_item_keys)
 
     def test_seed_work_item_from_raw_uses_tier_defaults(self) -> None:
         raw = {

@@ -438,13 +438,25 @@ Requirements:
 2. Treat the provided scope and test plan as preflight guidance, but refine them if repository evidence supports a safer narrow adjustment.
 3. Stay within the smallest safe surface area unless you discover a blocker that requires explicit expansion.
 4. Make the smallest safe fix that resolves the issue.
-5. Run the required validation commands when possible, and report exact results plus any gaps.
+5. For dependency or scanner-driven work, prefer one bounded PR per advisory or CVE. If the issue aggregates multiple unrelated advisories, fix only the tightest subset in this PR and explain the remaining ones in the PR body so they can be tracked separately.
 6. If the issue is not actionable, if the scope tier implies manual approval, or if the change becomes riskier than expected, stop and explain why.
 7. Open a pull request against the default branch of `{owner}/{repo}` if the work can be completed safely.
 
+Validation contract (must be produced):
+A. Before making any code change, capture a "scanner_before" receipt by running the most relevant scanner for this work item inside your sandbox. Examples by ecosystem:
+   - npm: `npm audit --json` (or `npm audit`) for the affected package.
+   - python: `pip-audit -r <requirements-file> --no-deps` or `pip-audit --strict`.
+   - generic/security: the narrowest credible reproduction or inspection command.
+   Record the exact command, exit code, and the advisory IDs it reports.
+B. After making the fix, re-run the exact same scanner and capture a "scanner_after" receipt. The fix is only considered validated if the targeted advisory is no longer reported.
+C. Run the scoped tests listed above (or the narrowest credible substitute if those tests are not appropriate for this repository state) and record exact commands, exit codes, and a short pass/fail summary.
+D. If any required validation command cannot run in the sandbox (missing toolchain, network-locked, etc.), state exactly which command failed and why, and do not pretend the fix is validated.
+E. The PR description must include both receipts (before/after scanner output plus test outcomes) so a reviewer can verify the fix without re-running anything.
+
 Output expectations:
 - You own the engineering loop for this work item: investigation, fix selection, validation, and PR/reporting.
-- If you stop, explain the blocker or manual-review reason clearly.
+- Populate the structured output fields `scanner_before`, `scanner_after`, `tests`, `residual_risk`, and `pr_url` honestly. Empty or fabricated receipts are a failure mode.
+- If you stop, explain the blocker or manual-review reason clearly in `blocked_reason`.
 - Do not broaden scope into unrelated refactors.
 """
 
@@ -492,13 +504,14 @@ Goal:
 - Find at most {max_findings} actionable security or vulnerability remediation candidates.
 
 Requirements:
-1. Only report findings that are strongly supported by repository evidence or deterministic dependency/security evidence.
+1. Only report findings that are strongly supported by repository evidence or deterministic dependency/security evidence (scanner output, pinned-vulnerable versions, advisory IDs, etc.).
 2. Prefer concrete dependency vulnerabilities, unsafe configuration, or clearly actionable security flaws over speculative concerns.
-3. Validate that each finding is real enough to justify creating a tracked GitHub issue.
-4. If you are not confident a finding is real and actionable, do not include it.
-5. Keep the list short and high signal. Returning zero findings is acceptable.
+3. Validate that each accepted finding is real enough to justify creating a tracked GitHub issue in this repository.
+4. Prefer one advisory or CVE per finding so downstream remediation PRs stay bounded. Only aggregate multiple advisories into one finding if they share a single package bump with no other surface.
+5. If you are not confident a finding is real and actionable, do not include it in `findings`. Instead, record it in `rejected_findings` with a short, concrete reason.
+6. Keep the accepted list short and high signal. Returning zero accepted findings is acceptable.
 
-For each finding you include:
+For each accepted finding you include:
 - Provide a concise title and problem statement.
 - State the evidence and why it is actionable in this repository.
 - Suggest the smallest safe remediation scope.
@@ -506,14 +519,48 @@ For each finding you include:
 - Provide a narrow validation plan.
 - Include labels that would make sense on a tracked GitHub issue.
 
+For each rejected finding you considered but discarded:
+- Record the advisory ID or short title.
+- Explain in one or two sentences why it is not actionable here (false positive, unused code path, upstream-only advisory, too-large bump, already fixed, etc.).
+- This audit trail is part of the deliverable; an empty `rejected_findings` list is acceptable only if nothing was considered and rejected.
+
 Important constraints:
 - Do not propose broad refactors.
-- Do not include hypothetical or weakly supported issues.
+- Do not include hypothetical or weakly supported issues in `findings`.
 - Prefer fewer, higher-confidence findings over many marginal ones.
 """
 
 
 def session_output_schema() -> dict[str, Any]:
+    scanner_receipt = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "command": {"type": "string"},
+            "exit_code": {"type": "integer"},
+            "advisories_reported": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "output_excerpt": {"type": "string"},
+            "ran": {"type": "boolean"},
+            "not_run_reason": {"type": "string"},
+        },
+        "required": ["command", "ran"],
+    }
+    test_receipt = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "command": {"type": "string"},
+            "exit_code": {"type": "integer"},
+            "passed": {"type": "boolean"},
+            "summary": {"type": "string"},
+            "ran": {"type": "boolean"},
+            "not_run_reason": {"type": "string"},
+        },
+        "required": ["command", "ran"],
+    }
     return {
         "type": "object",
         "additionalProperties": False,
@@ -522,6 +569,22 @@ def session_output_schema() -> dict[str, Any]:
             "summary": {"type": "string"},
             "validation": {"type": "string"},
             "blocked_reason": {"type": "string"},
+            "pr_url": {"type": "string"},
+            "scanner_before": scanner_receipt,
+            "scanner_after": scanner_receipt,
+            "tests": {
+                "type": "array",
+                "items": test_receipt,
+            },
+            "residual_risk": {"type": "string"},
+            "fixed_advisories": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "deferred_advisories": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
         },
         "required": ["result", "summary"],
     }
@@ -598,6 +661,19 @@ def discovery_output_schema() -> dict[str, Any]:
         "additionalProperties": False,
         "properties": {
             "summary": {"type": "string"},
+            "rejected_findings": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "id": {"type": "string"},
+                        "title": {"type": "string"},
+                        "reason": {"type": "string"},
+                    },
+                    "required": ["title", "reason"],
+                },
+            },
             "findings": {
                 "type": "array",
                 "items": {

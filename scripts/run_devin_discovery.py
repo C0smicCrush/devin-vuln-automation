@@ -125,6 +125,8 @@ def create_issue_from_finding(owner: str, repo: str, token: str, finding: dict, 
         "\n## Discovery Notes\n"
         f"- Created from bounded Devin discovery session: {session_url}\n"
         "- This issue should be re-validated by the remediation session before code changes are made.\n"
+        "- Remediation PR must include before/after scanner receipts and the exact test commands run.\n"
+        "- Keep the PR bounded to this advisory; split any additional CVEs into separate tracked issues.\n"
     )
     labels = list(dict.fromkeys(finding["issue_labels"] + ["devin-remediate", "devin-discovered", f"finding:{slugify(finding['id'])}"]))
     ensure_labels(owner, repo, token, labels)
@@ -169,6 +171,7 @@ def main() -> None:
     final_session = poll_session_until_terminal(devin_org_id, devin_api_key, session["session_id"], args.poll_timeout_seconds)
     structured = final_session.get("structured_output") or {"summary": "", "findings": []}
     findings = structured.get("findings", [])
+    rejected = structured.get("rejected_findings") or []
     existing_issues = existing_open_issues(owner, repo, gh_token)
 
     created = []
@@ -204,6 +207,7 @@ def main() -> None:
         "issues_created": len(created),
         "created": created,
         "skipped": skipped,
+        "rejected_findings": rejected,
     }
     json_dump(Path(args.state_file), output)
     print_json(output)

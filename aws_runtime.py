@@ -446,7 +446,9 @@ def launch_remediation_session(settings: dict[str, Any], work_item: dict[str, An
                 f"- Session ID: `{session['session_id']}`\n"
                 f"- Scope tier: `{work_item['scope_tier']}`\n"
                 f"- Automation decision: `{work_item['automation_decision']}`\n"
-                f"- Session URL: {session['url']}"
+                f"- Session URL: {session['url']}\n\n"
+                "Devin must attach before/after scanner receipts and test outcomes to the resulting PR. "
+                "If the sandbox cannot run a required command, the PR must state exactly which one and why."
             )
         },
     )

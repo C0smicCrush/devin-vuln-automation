@@ -697,6 +697,26 @@ The worker should not fully script the engineering plan.
 
 That preserves policy guardrails without shrinking Devin into a glorified code editor.
 
+### Validation receipts contract
+
+For the vulnerability flow, the structured output schema for the remediation session (`session_output_schema` in `scripts/common.py`) is explicit about what "validated" means. Devin must return:
+
+- `scanner_before`: the exact scanner command (`npm audit --json`, `pip-audit`, or equivalent), its exit code, and the advisory IDs it reported before the fix.
+- `scanner_after`: the same command rerun after the fix, with its exit code and advisory IDs, so the targeted advisory is demonstrably gone.
+- `tests`: a list of scoped test commands with exit code, pass/fail flag, and short summary.
+- `fixed_advisories` / `deferred_advisories`: what this PR actually addresses versus what has been intentionally split off.
+- `residual_risk`: plain-language notes on anything not validated.
+
+Any command that could not be run is recorded with `ran: false` and a `not_run_reason`. Silent skips are not allowed; they must show up either as explicit receipts with `ran: false` or as a `blocked_reason` on the session. The remediation prompt reinforces this in natural language, and the PR description is expected to mirror the same receipts so a reviewer never has to rerun Devin's work to trust it.
+
+### One advisory per PR
+
+Both the discovery and remediation prompts bias toward one advisory or CVE per tracked issue and per PR. Aggregated findings are only acceptable when a single package bump closes multiple advisories with no other surface. When Devin must split work, the leftover advisories appear in `deferred_advisories` and should become their own issues on the next discovery pass. This keeps the diff small enough that the scanner receipts actually tell a coherent story.
+
+### Rejected findings audit trail
+
+The discovery schema (`discovery_output_schema`) requires a `rejected_findings` list where Devin records candidates it considered and discarded, each with a short reason. The discovery Lambda and the `make discover-devin` runner return that list in their output. This turns discovery from a one-way filter into an auditable pass: reviewers can see both what became a tracked issue and what Devin looked at and deliberately walked away from.
+
 ## GitHub Artifact Strategy
 
 GitHub is the visible audit layer for the system.

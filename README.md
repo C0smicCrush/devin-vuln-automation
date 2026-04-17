@@ -264,6 +264,26 @@ That means the worker can tell Devin:
 
 But Devin should still decide the actual engineering plan.
 
+### Validation receipts contract
+
+For the vulnerability flow specifically, Devin is required to attach structured receipts to every remediation PR. The remediation prompt and structured output schema both enforce this:
+
+- `scanner_before`: exact command, exit code, and advisory IDs produced by the relevant scanner (`npm audit --json`, `pip-audit`, or equivalent) before any code change.
+- `scanner_after`: the same command, rerun after the fix, so reviewers can see the advisory disappear.
+- `tests`: each scoped test command with its exit code, a pass/fail flag, and a short summary.
+- `fixed_advisories` / `deferred_advisories`: advisories this PR actually resolves versus ones deliberately left for follow-up issues.
+- `residual_risk`: a plain-language note about anything that was not validated and why.
+
+If a required command cannot run in Devin's sandbox, it must be recorded with `ran: false` and a `not_run_reason`. Silent skips are treated as a failure mode rather than a success.
+
+### One advisory per PR
+
+Both the discovery and remediation prompts push toward one advisory or CVE per tracked issue and per PR. If a finding aggregates several advisories that do not share a single package bump, Devin is instructed to remediate only the tightest subset in this PR and to note the remaining advisories as deferred so they can be picked up as their own issues. This keeps review surface bounded and keeps the scanner receipts meaningful.
+
+### Rejected findings audit trail
+
+The discovery prompt and schema require Devin to record candidates it considered and discarded in `rejected_findings`, with a short reason (false positive, unused code path, upstream-only, already fixed, too-large bump, etc.). The discovery Lambda and local runner return that list alongside the accepted findings, so reviewers can see both what became an issue and what was deliberately not pursued.
+
 ## Thin Lambda Principle
 
 Lambda is deliberately not the brains of the system.
@@ -412,6 +432,20 @@ Supported intake paths:
 - `/github`
 - `/linear`
 - `/manual`
+
+### Continuous deployment
+
+`.github/workflows/deploy.yml` runs on every push to `main` (and on manual `workflow_dispatch`). It runs the unit test suite and, only if tests pass, executes `infra/deploy_aws.sh` against the configured AWS account. The script is idempotent, so repeated pushes reconverge the stack rather than recreating it.
+
+Required repo secrets:
+
+- `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (credentials for the deploy target account)
+- `DEVIN_API_KEY` and `DEVIN_ORG_ID` (only consumed on first deploy to seed Secrets Manager)
+- `GH_TOKEN` (optional; falls back to `GITHUB_TOKEN`. Needed with `admin:repo_hook` scope only if the GitHub webhook on `superset-remediation` has to be (re)created; otherwise the script skips that step.)
+
+Optional repo variable:
+
+- `AWS_REGION` (defaults to `us-east-1`)
 
 ## Local Development
 

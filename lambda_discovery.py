@@ -57,6 +57,7 @@ def handler(event, context):  # noqa: ANN001
         )
         structured = final_session.get("structured_output") or {"summary": "", "findings": []}
         findings = structured.get("findings", [])
+        rejected = structured.get("rejected_findings") or []
         open_issues = existing_open_issues(settings["owner"], settings["repo"], settings["gh_token"])
 
         created = []
@@ -99,6 +100,7 @@ def handler(event, context):  # noqa: ANN001
             "issues_created": len(created),
             "created": created,
             "skipped": skipped,
+            "rejected_findings": rejected,
         }
     finally:
         release_discovery_lock(settings)
