@@ -35,6 +35,7 @@ class EventParsingTests(unittest.TestCase):
         }
         parsed = parse_incoming_event(event, self.settings)
         self.assertEqual(parsed["event_phase"], "raw")
+        self.assertEqual(parsed["event_type"], "manual")
         self.assertEqual(parsed["source"]["type"], "manual_endpoint")
         self.assertEqual(parsed["title"], "Security work item")
 
@@ -53,14 +54,73 @@ class EventParsingTests(unittest.TestCase):
             ),
         }
         parsed = parse_incoming_event(event, self.settings)
+        self.assertEqual(parsed["event_type"], "linear_ticket")
         self.assertEqual(parsed["source"]["type"], "linear_ticket")
         self.assertEqual(parsed["source"]["id"], "lin-1")
+
+    def test_manual_event_preserves_explicit_discovery_type(self) -> None:
+        event = {
+            "rawPath": "/manual",
+            "headers": {},
+            "body": json.dumps(
+                {
+                    "id": "manual-discovery",
+                    "event_type": "scheduled_discovery",
+                    "title": "Daily discovery",
+                    "body": "Inspect for actionable findings.",
+                    "labels": [],
+                }
+            ),
+        }
+        parsed = parse_incoming_event(event, self.settings)
+        self.assertEqual(parsed["event_type"], "scheduled_discovery")
 
     def test_github_non_issue_event_is_ignored(self) -> None:
         event = {
             "rawPath": "/github",
             "headers": {"x-github-event": "push"},
             "body": json.dumps({}),
+        }
+        parsed = parse_incoming_event(event, self.settings)
+        self.assertTrue(parsed["ignored"])
+
+    def test_github_issue_without_devin_label_is_ignored(self) -> None:
+        event = {
+            "rawPath": "/github",
+            "headers": {"x-github-event": "issues"},
+            "body": json.dumps(
+                {
+                    "action": "opened",
+                    "issue": {
+                        "id": 1,
+                        "number": 1,
+                        "title": "Investigate frontend issue",
+                        "body": "Potential problem",
+                        "labels": [{"name": "security"}],
+                    },
+                }
+            ),
+        }
+        parsed = parse_incoming_event(event, self.settings)
+        self.assertTrue(parsed["ignored"])
+
+    def test_github_non_devin_label_event_is_ignored(self) -> None:
+        event = {
+            "rawPath": "/github",
+            "headers": {"x-github-event": "issues"},
+            "body": json.dumps(
+                {
+                    "action": "labeled",
+                    "label": {"name": "security"},
+                    "issue": {
+                        "id": 2,
+                        "number": 2,
+                        "title": "Resolve vulnerability",
+                        "body": "Tracked issue",
+                        "labels": [{"name": "security"}, {"name": "devin-remediate"}],
+                    },
+                }
+            ),
         }
         parsed = parse_incoming_event(event, self.settings)
         self.assertTrue(parsed["ignored"])

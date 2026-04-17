@@ -1,177 +1,306 @@
-# Devin-Driven Event Remediation on AWS
+# Event-Driven Devin Remediation on AWS
 
 ## TL;DR
 
-This project is an AWS-hosted event-driven remediation pipeline that treats Devin as the core primitive in two separate stages:
+This project is an AWS-hosted event-driven remediation control plane for a fork of Apache Superset.
 
-1. A thin AWS intake layer receives events and buffers them in SQS FIFO.
-2. The AWS worker asks Devin to normalize the event into a scoped work item, and then asks Devin again to remediate it if automation is safe.
+The key design choice is simple:
 
-Supported event sources:
+`AWS governs the workflow. Devin performs the engineering work.`
 
-- GitHub issue events, with vulnerability-related issues as the P0 source
-- Manual endpoint hits
-- Linear ticket events, currently stubbed but fully represented in the architecture
+In practice that means:
 
-AWS is the primary runtime:
+1. An engineering event is created by a human, a deterministic tool, or a scheduled discovery run.
+2. AWS intake receives the event, validates it, wraps it in a canonical envelope, and buffers it in SQS FIFO.
+3. The worker launches Devin as the end-to-end remediation operator for that work item.
+4. Devin investigates the issue, scopes the blast radius, chooses validation, makes the fix if appropriate, and opens or updates a PR.
+5. A poller tracks status and publishes observable outputs to GitHub, S3, and CloudWatch.
 
-- Lambda Function URL for intake
-- SQS FIFO for buffered ordering
-- Lambda worker for remediation
-- Lambda poller for observability
-- Secrets Manager for credentials
-- S3 for lightweight report snapshots
+The system is intentionally multi-source. Events can come from:
 
-This deliberately does not try to be a new scanner. Existing tools like Dependabot, `npm audit`, `pip-audit`, and Trivy can produce findings. This system handles the harder part: turning raw events into scoped engineering work and driving Devin through the full remediation loop.
+- GitHub issues explicitly labeled `devin-remediate`
+- Linear tickets
+- manual API requests
+- scheduled scanner findings such as `npm audit`
+- scheduled Devin discovery runs
+
+This project does not try to replace scanners. Existing tools produce findings; this system turns those findings into governed remediation work and uses Devin to execute the engineering loop.
 
 ## Repositories
 
 - Target application repo: `C0smicCrush/superset-remediation`
 - Automation repo: `C0smicCrush/devin-vuln-automation`
 
-`superset-remediation` is where the tracked GitHub issues and remediation PRs live.
+`superset-remediation` is the work surface where issues and remediation PRs live.
 
-`devin-vuln-automation` contains the AWS runtime, Lambda handlers, SQS integration, deployment script, testing tier matrix, unit tests, and local simulation tooling.
+`devin-vuln-automation` is the control plane. It contains the Lambda handlers, SQS integration, deployment scripts, prompt helpers, scope/test policy, and simulation tooling.
+
+## What This System Does
+
+This project solves a specific workflow problem:
+
+`when a remediation-worthy engineering signal appears, route it through a low-cost event system and let Devin handle the actual engineering task with observable outcomes`
+
+The signal can be a vulnerability finding, a ticket, or a tracked issue. The system does not assume all work starts as a GitHub issue, but it does use GitHub as the most important human-visible artifact surface.
+
+## Why Devin Is The Primitive
+
+The take-home prompt explicitly asks for Devin to be used as a core primitive, not as a helper.
+
+So the system is designed such that AWS does not become the reasoning engine.
+
+AWS is responsible for:
+
+- receiving and validating events
+- canonicalizing payloads
+- queueing and ordering work
+- enforcing rate limits and safety controls
+- launching Devin sessions
+- polling session state
+- publishing metrics and status
+
+Devin is responsible for:
+
+- interpreting the incoming issue or finding
+- inspecting repository context
+- deciding whether the work item is actionable
+- identifying the smallest safe remediation
+- choosing the right validation scope
+- making code changes
+- running validation
+- opening or updating a PR
+- summarizing blockers, residual risk, or manual-review needs
+
+That split keeps the control plane thin and makes Devin the owner of the engineering loop.
+
+## Event Sources
+
+The architecture supports five event-source classes.
+
+### 1. GitHub issue events
+
+Examples:
+
+- issue opened with `devin-remediate`
+- issue reopened with `devin-remediate`
+- issue labeled `devin-remediate`
+
+This is the cleanest P0 source because it aligns directly with the assignment and gives reviewers visible work items inside the fork.
+
+Important detail:
+
+- the deployed intake only accepts `issues` webhook events that explicitly carry `devin-remediate`
+
+### 2. Linear ticket events
+
+Examples:
+
+- ticket created in a remediation queue
+- ticket moved to `ready-for-remediation`
+- ticket labeled security or dependency-related
+
+This path proves the system is not GitHub-specific.
+
+### 3. Manual API events
+
+Examples:
+
+- manual POST to `/manual`
+- replay of a fixture for demos
+- operator-triggered remediation run
+
+This path exists for deterministic demos and easy replay.
+
+### 4. Scheduled scanner events
+
+Examples:
+
+- EventBridge schedule triggers a lightweight scan
+- `npm audit --json` or similar produces findings
+- findings are emitted into the standard intake path
+
+This is the strongest deterministic vulnerability source because it keeps detection simple and lets Devin focus on investigation, remediation, and validation.
+
+### 5. Scheduled Devin discovery events
+
+Examples:
+
+- daily repo review
+- bounded dependency review
+- targeted review of recently changed code paths
+
+This is how Devin can "find issues itself." A scheduler or operator triggers a discovery run, Devin emits structured findings, and those findings become issues or remediation events.
+
+The hosted stack now includes an EventBridge-driven discovery schedule:
+
+- EventBridge rule: every `2 hours`
+- target: `devin-vuln-automation-discovery`
+- default input: `{"event_type":"scheduled_discovery","max_findings":1}`
+
+### Bounded discovery driver
+
+There is also a bounded discovery driver for low-volume end-to-end runs:
+
+```bash
+make discover-devin
+```
+
+By default it is intentionally conservative:
+
+- launches at most one discovery session at a time
+- asks Devin for at most one actionable finding by default
+- only creates issues for medium/high-confidence findings
+- dedupes against existing open issues before creating a new one
+- creates labeled GitHub issues that then enter the normal AWS webhook -> SQS -> worker path
 
 ## Architecture
 
 ```mermaid
 flowchart TD
-    github[GitHubIssueWebhook] --> intake[LambdaIntakeThin]
-    manual[ManualEndpointPost] --> intake
-    linear[LinearStubEvent] --> intake
-    intake --> buffer[SQSFifoBuffer]
-    buffer --> worker[LambdaWorkerThin]
-    worker --> devinNormalize[DevinNormalizationSession]
-    devinNormalize --> trackedIssue[CanonicalGitHubWorkItem]
-    worker --> devinFix[DevinRemediationSession]
-    devinFix --> prs[SupersetPullRequest]
-    devinFix --> issues[IssueCommentsAndStatus]
-    poller[ScheduledLambdaPoller] --> devinFix
-    poller --> reports[S3MetricsSnapshot]
+    github[GitHub Issue Event] --> intake[Lambda Intake]
+    linear[Linear Ticket Event] --> intake
+    manual[Manual API Event] --> intake
+    scanner[Scheduled Scanner Finding] --> intake
+    discovery[EventBridge Scheduled Discovery] --> discoverylambda[Discovery Lambda]
+    discoverylambda --> discoveryissue[GitHub Issue Created]
+    discoveryissue --> github
+    intake --> buffer[SQS FIFO Buffer]
+    buffer --> worker[Lambda Worker]
+    worker --> devin[Devin Remediation Session]
+    devin --> pr[Pull Request]
+    devin --> issue[Issue Updates]
+    poller[Scheduled Poller] --> devin
+    poller --> metrics[S3 Metrics Snapshot]
+    poller --> logs[CloudWatch Logs]
 ```
 
-## Event Sources
+## End-To-End Flow
 
-### GitHub issues
+1. An event is created by a human, tool, scheduler, or Devin discovery run.
+2. Intake Lambda receives the event and wraps it in a canonical event envelope.
+3. The event is written to SQS FIFO using a family-specific ordering key.
+4. Worker Lambda consumes the message once it is eligible.
+5. The worker applies guardrails such as concurrency limits and manual-review policy.
+6. The worker launches one broad Devin session for the work item.
+7. Devin investigates the issue, chooses the remediation strategy, validates its work, and opens or updates a PR if appropriate.
+8. Poller Lambda tracks the session and writes status back to GitHub and S3.
 
-This is the P0 path for the vulnerability-focused version of the project.
+For `linear_ticket` inputs and explicit discovery-mode events, the worker can still route through a lightweight preflight scoping step first. For GitHub issues, manual remediation payloads, and scanner-shaped findings, the default path is now one broad Devin remediation session.
 
-- GitHub sends an issue webhook to the Lambda Function URL.
-- The intake Lambda only verifies/parses the webhook and enqueues the raw event.
-- The worker asks Devin to decide whether the item is actually security relevant before remediation.
+For scheduled Devin discovery, the flow is slightly different:
 
-### Manual endpoint
+1. EventBridge invokes `devin-vuln-automation-discovery`.
+2. Discovery Lambda acquires the discovery lease and checks for an already-active discovery session.
+3. Discovery Lambda launches one bounded Devin discovery session.
+4. If Devin returns a high-confidence finding, Discovery Lambda creates a labeled GitHub issue.
+5. That issue then enters the normal GitHub webhook -> intake -> SQS -> worker remediation path.
 
-This is the operator/debug path.
+## Canonical Event Model
 
-- A caller hits the same Function URL with a JSON payload.
-- The intake Lambda wraps it and enqueues it without trying to reason about the task.
+All event sources are wrapped into a common envelope before they hit the worker.
 
-### Linear tickets
+Representative fields include:
 
-This is currently stubbed, but supported in the design.
+- `event_type`
+- `event_phase`
+- `source.type`
+- `source.action`
+- `source.id`
+- `source.url`
+- `repo.owner`
+- `repo.name`
+- `title`
+- `body`
+- `labels`
+- `created_at`
+- `family_key`
+- `canonical_issue_number`
+- `origin_metadata`
 
-- A Linear payload can hit the same intake Lambda.
-- The system treats it the same way as any other source: enqueue -> normalize with Devin -> remediate with Devin.
-
-## Why Devin Is Used Twice
-
-This design intentionally uses Devin in two roles.
-
-### 1. Normalization primitive
-
-The worker asks Devin to act as a scoped analysis engine:
-
-- reads the raw source event
-- turns it into a clean problem statement
-- decides whether it is security related
-- assigns a scope tier
-- proposes a test plan
-- decides whether full automation is safe or manual approval is required
-
-This gives the pipeline a richer work item than a raw GitHub webhook or audit finding, while keeping Lambda itself intentionally dumb.
-
-### 2. Remediation primitive
-
-After the buffered queue delay, Devin handles the actual fix:
-
-- makes the code change in `superset-remediation`
-- runs the scoped validation plan
-- reports blockers or approval needs
-- opens a PR when the fix is safe to land
+The envelope is meant to standardize transport, not to replace Devin's reasoning.
 
 ## Queueing Model
 
-The queue is intentionally not just a fire-and-forget pipe.
+The queue is intentionally not just a pass-through.
 
 - AWS service: SQS FIFO
-- Default delay: 30 seconds in the current test deployment, configurable back to 5 minutes for production
-- Ordering scope: per-family ordering key, never global ordering
-- Worker batch size: 1
-- Worker logic is intentionally thin and primarily orchestrates Devin calls
+- Buffer queue: `devin-vuln-automation-buffer.fifo`
+- DLQ: `devin-vuln-automation-dlq.fifo`
+- Default live test delay: `30s`
+- Production-style delay: `300s`
+- Ordering scope: per `family_key`, not global
+- Worker batch size: `1`
 
 ### Why the buffered hold exists
 
-The delay gives the pipeline a chance to preserve local ordering for related work items, especially when multiple dependency-related or semantically related events arrive close together.
-
-We never try to globally reorder the entire queue. We only preserve ordering inside a message group, such as a shared dependency family or issue family key. Within that family, the first created event goes first.
+The delay creates a small stickiness window so related events can remain locally ordered. This matters most for dependency families, repeated issue updates, or semantically related findings.
 
 ### Queue backpressure trade-off
 
-This introduces intentional latency and can create queue backpressure during bursts. That is a conscious trade-off:
+The FIFO delay improves local ordering and reduces overlapping remediation attempts, but it also increases latency and can create backlog during bursts. That trade-off is intentional.
 
-- better local ordering for related events
-- lower chance of racing two overlapping remediations
-- easier reasoning about dependency-related work
+## Testing and Scope Policy
 
-The downside is slower time-to-remediation during spikes. The README calls this out explicitly because it is a deliberate architecture choice, not an accident.
+The system keeps explicit scope and validation policy so the automation remains interpretable.
 
-## Scope Normalization and Testing Tiers
+Policy lives in:
 
-The normalization step outputs a full scope card, not just a summary.
+- `config/test_tiers.json`
 
-The work item includes:
-
-- normalized problem statement
-- family key for ordering
-- scope tier
-- automation decision
-- confidence level
-- likely touched files
-- impacted surface
-- suggested validation commands
-- whether new tests are likely needed
-- manual checks if approval is required
-
-The current tier matrix lives in `config/test_tiers.json`.
-
-### Tier intent
+Current tiers:
 
 - `tier0_auto_dependency_patch`
-  - small direct dependency bump
-  - existing validation likely sufficient
 - `tier1_auto_targeted_runtime`
-  - runtime-facing but still bounded
-  - requires more focused validation and often targeted regression coverage
 - `tier2_manual_review`
-  - broader impact or lower confidence
-  - human approval expected before full automation
 - `tier3_manual_hold`
-  - stop after scoping
-  - do not auto-remediate
 
-This is the foundation for the skeletonized testing framework: the test plan is generated per work item by Devin, but mapped into stable automation tiers so the system stays interpretable.
+These tiers should be thought of as policy guidance for Devin, not as a hardcoded workflow engine inside Lambda.
+
+That means the worker can tell Devin:
+
+- what automation levels are allowed
+- when manual review is required
+- how broad the expected validation should be
+
+But Devin should still decide the actual engineering plan.
+
+## Thin Lambda Principle
+
+Lambda is deliberately not the brains of the system.
+
+The AWS functions only do glue work:
+
+- verify and parse source events
+- enqueue canonical payloads
+- enforce concurrency and queue behavior
+- launch Devin
+- mirror status to GitHub and S3
+
+They do not try to become a scoping engine, prioritization engine, or remediation planner.
+
+## Current Validation State
+
+The system has already exercised meaningful pieces of the end-to-end path.
+
+Validated behavior includes:
+
+- manual intake event handling
+- queue buffering
+- worker-driven Devin launch
+- status propagation back to GitHub
+- real remediation activity tied to a DOMPurify-related finding path
+
+The strongest live validation during development was a remediation PR flow against `superset-remediation`, even though later cleanup changed the final visible repository state.
 
 ## Live Deployment Notes
 
-The current deployed stack is running in `us-east-1` and is configured for fast iteration:
+The current deployed stack is in `us-east-1` and was configured for fast testing iteration:
 
 - SQS FIFO delay is `30s`
-- the intake Lambda Function URL is live
-- the `superset-remediation` repo has an `issues` webhook pointed at the `/github` intake path
+- intake is exposed through a Lambda Function URL
+- issue-based webhook flow was exercised against `superset-remediation`
 
-For a production-style delay, redeploy with:
+To redeploy with a production-style delay:
 
 ```bash
 QUEUE_DELAY_SECONDS=300 bash infra/deploy_aws.sh
@@ -181,46 +310,35 @@ QUEUE_DELAY_SECONDS=300 bash infra/deploy_aws.sh
 
 This is designed for a personal AWS account and intentionally avoids expensive services.
 
-- Lambda Function URL is used instead of API Gateway to keep the ingress path cheap.
-- Lambda memory is kept small:
-  - intake: 512 MB
-  - worker: 256 MB
-  - poller: 256 MB
-- Worker SQS mapping concurrency is capped at 2, while in-app remediation concurrency is separately limited.
-- SQS batch size is 1 to avoid bursty fan-out.
-- Secrets are consolidated into a single Secrets Manager JSON secret to reduce monthly secret count.
-- S3 is used for lightweight report snapshots instead of a heavier database/dashboard stack.
+- Lambda Function URL instead of API Gateway
+- small Lambda memory sizes
+- SQS instead of a custom orchestration backend
+- single shared Secrets Manager JSON secret
+- S3 for lightweight snapshots instead of a heavier database layer
+- capped worker concurrency
+- application-level remediation cap in addition to AWS concurrency controls
 
 ## Rate Limiting
 
 There are two layers of rate limiting:
 
-1. SQS event source mapping concurrency on the worker
-2. `MAX_ACTIVE_REMEDIATIONS` guard inside the worker
+1. SQS event source concurrency on the worker
+2. `MAX_ACTIVE_REMEDIATIONS` inside the worker
 
-In practice, because this AWS account has a low concurrency floor, the deployment uses an SQS event source maximum concurrency of 2 and then applies the tighter application-level remediation cap with `MAX_ACTIVE_REMEDIATIONS`.
+If the active remediation count is already at the configured maximum, the worker defers or re-enqueues the item instead of launching another Devin session immediately.
 
-If the active remediation count is already at the configured maximum, the worker re-enqueues the message with a short delay instead of launching another remediation session immediately.
+Additional anti-spam controls:
 
-## Thin Lambda Principle
-
-Lambda is deliberately not the brains of the system.
-
-The AWS functions only do glue work:
-
-- verify and parse source events
-- enqueue raw payloads
-- call Devin for normalization
-- call Devin for remediation
-- mirror status to GitHub and S3
-
-They do not try to implement their own scoping engine, custom prioritization engine, or remediation planner. That logic belongs in Devin so the architecture clearly demonstrates Devin as the primitive rather than Lambda as a hidden rules engine.
+- GitHub issue webhook intake only accepts `issues` events that are explicitly labeled `devin-remediate`
+- repeated issue events for the same issue number are deduped against active remediation sessions
+- discovery is capped to a very small number of findings per run
+- scheduled discovery uses an S3-backed lease plus an active-session check so overlapping discovery runs are skipped rather than duplicated
 
 ## Secrets and Configuration
 
 AWS is the primary secret store.
 
-One Secrets Manager secret stores:
+The shared Secrets Manager secret holds values such as:
 
 - `GH_TOKEN`
 - `DEVIN_API_KEY`
@@ -231,16 +349,15 @@ One Secrets Manager secret stores:
 - `TARGET_REPO_NAME`
 - `AWS_METRICS_BUCKET`
 - `MAX_ACTIVE_REMEDIATIONS`
+- `MAX_DISCOVERY_FINDINGS`
+- `DISCOVERY_TIMEOUT_SECONDS`
+- `DISCOVERY_LOCK_TTL_SECONDS`
 - `DEVIN_BYPASS_APPROVAL`
 
-Lambdas receive only lightweight environment variables:
+Notes:
 
-- `AWS_APP_SECRET_NAME`
-- `AWS_SQS_QUEUE_URL`
-- `AWS_METRICS_BUCKET`
-- `MAX_ACTIVE_REMEDIATIONS`
-- `TARGET_REPO_OWNER`
-- `TARGET_REPO_NAME`
+- `LINEAR_WEBHOOK_SECRET` may be stored for future production hardening, but the current `/linear` path is still a stub and does not yet enforce signature verification.
+- Lambdas only receive lightweight environment variables where possible.
 
 ## Repository Layout
 
@@ -250,6 +367,7 @@ Lambdas receive only lightweight environment variables:
 ├── lambda_intake.py
 ├── lambda_worker.py
 ├── lambda_poller.py
+├── lambda_discovery.py
 ├── common.py
 ├── config/
 │   └── test_tiers.json
@@ -261,6 +379,7 @@ Lambdas receive only lightweight environment variables:
 │   ├── launch_devin_session.py
 │   ├── poll_devin_sessions.py
 │   ├── render_metrics.py
+│   ├── run_devin_discovery.py
 │   └── scan_or_import_findings.py
 ├── fixtures/
 ├── state/
@@ -272,26 +391,26 @@ Lambdas receive only lightweight environment variables:
 
 ## Deployment
 
-The project can be deployed entirely with the AWS CLI:
+Deploy with the AWS CLI:
 
 ```bash
 make deploy-aws
 ```
 
-This script:
+The deployment script:
 
-- creates the SQS FIFO queue and DLQ
+- creates the FIFO queue and DLQ
 - creates the S3 metrics bucket
 - creates or reuses the shared Secrets Manager secret
-- creates the Lambda IAM role and permissions
-- packages the Lambda code
-- deploys the intake, worker, and poller Lambdas
+- creates IAM role and permissions
+- packages and deploys intake, worker, poller, and discovery Lambdas
 - creates the Lambda Function URL
-- creates or updates the GitHub issue webhook on `superset-remediation`
 - wires SQS to the worker
-- schedules the poller every 5 minutes
+- schedules the poller
+- schedules EventBridge discovery every 2 hours
+- can wire GitHub issue webhooks for the target repo
 
-After deployment, the intake Function URL supports:
+Supported intake paths:
 
 - `/github`
 - `/linear`
@@ -299,7 +418,7 @@ After deployment, the intake Function URL supports:
 
 ## Local Development
 
-For local scripts and simulation:
+Export local credentials:
 
 ```bash
 export GH_TOKEN="$(gh auth token)"
@@ -309,7 +428,29 @@ export TARGET_REPO_OWNER="C0smicCrush"
 export TARGET_REPO_NAME="superset-remediation"
 ```
 
-Legacy local flows still exist for deterministic replay:
+Build the local container environment:
+
+```bash
+docker compose build
+```
+
+The default `docker compose` command is intentionally small: it runs the deterministic scanner-fixture ingestion path, not a full local Lambda stack.
+
+Run unit tests:
+
+```bash
+make test
+```
+
+Replay sample events against the deployed intake URL:
+
+```bash
+export INTAKE_URL="<lambda-url>"
+make invoke-manual
+make invoke-linear
+```
+
+Legacy replay flows still exist for deterministic local simulation:
 
 ```bash
 make discover
@@ -319,55 +460,46 @@ make poll
 make report
 ```
 
-Docker remains available for local packaging and repeatable runtime setup:
+## Optional GitHub Actions
 
-```bash
-docker compose build
-```
+The repo still contains GitHub Actions workflows in `.github/workflows/` for older or local/CI-style flows:
 
-Run the unit tests:
+- `discover.yml` runs the deterministic scanner-fixture -> issue path
+- `remediate.yml` launches a Devin remediation session directly for a chosen issue
+- `observe.yml` polls sessions and renders local metrics artifacts
 
-```bash
-make test
-```
-
-Replay sample events against the deployed intake URL:
-
-```bash
-export INTAKE_URL="https://ymydxnbhsmlifqxnw55oahd4r40aazsr.lambda-url.us-east-1.on.aws"
-make invoke-manual
-make invoke-linear
-```
+These workflows are not the primary hosted control plane. The main deployed path is AWS-based.
 
 ## Observability
 
-The observability story is intentionally simple but leadership-friendly.
+The observability layer is intentionally simple but sufficient for a technical audience.
 
 Outputs include:
 
-- GitHub issue comments in `superset-remediation`
-- Devin session URLs and PR links
+- GitHub issue comments
+- Devin session links and PR links
 - S3 snapshot `reports/latest.json`
 - CloudWatch logs from intake, worker, and poller
 
-The key metrics are:
+In local or GitHub Actions helper flows, metrics may also be written to `metrics/latest.json`; that is separate from the hosted S3 snapshot path.
 
-- total normalized work items
-- active remediation sessions
+Key metrics include:
+
+- queued work items
+- active Devin sessions
 - completed sessions
-- blocked/manual-review sessions
+- blocked or manual-review sessions
 - failed sessions
 - PRs opened by Devin
 
-## CI/CD
-
-The current repo includes a CLI-driven deploy path rather than a heavier managed CI/CD stack because the goal is to stay cost-conscious on a personal AWS account.
-
-The natural next step is to wire `infra/deploy_aws.sh` into CodeBuild or CodePipeline. That would keep the same deployment contract while moving packaging and promotion into AWS-native CI/CD.
-
 ## Trade-Offs
 
-- Findings and non-GitHub sources can be stubbed for deterministic demos, but the intake path is designed around real webhook traffic.
-- The FIFO delay improves local ordering but increases queue latency and potential backpressure.
-- Devin-based normalization is more expensive than a pure rule engine, but it produces richer scope and testing decisions for ambiguous engineering work.
-- The worker is intentionally rate-limited to protect both AWS cost and the target repository from too much concurrent automation.
+- Scanner findings are more deterministic than pure Devin discovery, so both should exist.
+- FIFO buffering improves local ordering but increases time-to-remediation during bursts.
+- Keeping preflight limited to Linear and discovery-mode inputs preserves a clean main loop while retaining a safety valve for noisier sources.
+- Tight concurrency limits protect both AWS cost and the target repo, but reduce throughput.
+- GitHub is the best audit surface for reviewers, even when the original signal came from somewhere else.
+
+## More Detail
+
+For the deeper design document, including event taxonomy, source-by-source workflows, current-vs-target architecture, and explicit AWS versus Devin ownership, see `ARCHITECTURE.md`.

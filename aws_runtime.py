@@ -23,7 +23,9 @@ from common import (
     json_load,
     load_test_tier_matrix,
     normalization_output_schema,
+    seed_work_item_from_raw,
     session_output_schema,
+    should_run_preflight,
     slugify,
     utc_now,
 )
@@ -53,6 +55,9 @@ def load_runtime_settings() -> dict[str, Any]:
         "repo_url": f"https://github.com/{owner}/{repo}",
         "max_active_remediations": int(payload.get("MAX_ACTIVE_REMEDIATIONS", os.getenv("MAX_ACTIVE_REMEDIATIONS", 2))),
         "normalization_timeout_seconds": int(payload.get("NORMALIZATION_TIMEOUT_SECONDS", os.getenv("NORMALIZATION_TIMEOUT_SECONDS", 180))),
+        "discovery_timeout_seconds": int(payload.get("DISCOVERY_TIMEOUT_SECONDS", os.getenv("DISCOVERY_TIMEOUT_SECONDS", 900))),
+        "discovery_lock_ttl_seconds": int(payload.get("DISCOVERY_LOCK_TTL_SECONDS", os.getenv("DISCOVERY_LOCK_TTL_SECONDS", 5400))),
+        "max_discovery_findings": int(payload.get("MAX_DISCOVERY_FINDINGS", os.getenv("MAX_DISCOVERY_FINDINGS", 1))),
         "remediation_bypass_approval": str(payload.get("DEVIN_BYPASS_APPROVAL", "false")).lower() in {"1", "true", "yes", "on"},
     }
 
@@ -97,16 +102,24 @@ def parse_incoming_event(event: dict[str, Any], settings: dict[str, Any]) -> dic
         if github_event != "issues":
             return {"ignored": True, "reason": f"Unsupported GitHub event: {github_event}"}
         issue = payload.get("issue", {})
+        action = payload.get("action", "")
         labels = [item["name"] for item in issue.get("labels", [])]
+        if action not in {"opened", "reopened", "labeled"}:
+            return {"ignored": True, "reason": f"Ignored GitHub issue action: {action}"}
+        if action == "labeled" and payload.get("label", {}).get("name") != "devin-remediate":
+            return {"ignored": True, "reason": "Ignored GitHub label event without devin-remediate"}
+        if action in {"opened", "reopened"} and "devin-remediate" not in labels:
+            return {"ignored": True, "reason": "Ignored GitHub issue without devin-remediate label"}
         title = issue.get("title", "")
         body = issue.get("body", "")
         return {
+            "event_type": payload.get("event_type", "github_issue"),
             "event_phase": "raw",
             "source": {
                 "type": "github_issue",
                 "id": str(issue.get("id", payload.get("delivery", "unknown"))),
                 "url": issue.get("html_url", ""),
-                "action": payload.get("action", ""),
+                "action": action,
             },
             "title": title,
             "body": body,
@@ -119,6 +132,7 @@ def parse_incoming_event(event: dict[str, Any], settings: dict[str, Any]) -> dic
     payload = json.loads(body_text or "{}")
     if source_type == "linear":
         return {
+            "event_type": payload.get("event_type", "linear_ticket"),
             "event_phase": "raw",
             "source": {
                 "type": "linear_ticket",
@@ -135,6 +149,7 @@ def parse_incoming_event(event: dict[str, Any], settings: dict[str, Any]) -> dic
         }
 
     return {
+        "event_type": payload.get("event_type", "manual"),
         "event_phase": "raw",
         "source": {
             "type": "manual_endpoint",
@@ -168,7 +183,7 @@ def poll_session_until_terminal(settings: dict[str, Any], session_id: str, timeo
 def normalize_with_devin(settings: dict[str, Any], raw_work_item: dict[str, Any]) -> dict[str, Any]:
     prompt = build_normalization_prompt(raw_work_item, load_test_tier_matrix(), settings["repo_url"])
     payload = {
-        "title": f"Normalize {raw_work_item['source']['type']} {raw_work_item['title'][:80]}",
+        "title": f"Preflight {raw_work_item['source']['type']} {raw_work_item['title'][:80]}",
         "prompt": prompt,
         "advanced_mode": "analyze",
         "repos": [settings["repo_url"]],
@@ -176,7 +191,7 @@ def normalize_with_devin(settings: dict[str, Any], raw_work_item: dict[str, Any]
         "structured_output_schema": normalization_output_schema(),
         "tags": [
             "project:devin-vuln-automation",
-            "phase:normalization",
+            "phase:preflight",
             f"family:{slugify(raw_work_item['family_key'])}",
         ],
     }
@@ -196,7 +211,36 @@ def normalize_with_devin(settings: dict[str, Any], raw_work_item: dict[str, Any]
         raise SystemExit(f"Normalization session {session['session_id']} completed without structured output")
     structured["normalization_session_id"] = session["session_id"]
     structured["normalization_session_url"] = session["url"]
+    structured["preflight_session_id"] = session["session_id"]
+    structured["preflight_session_url"] = session["url"]
     return structured
+
+
+def build_work_item_for_remediation(settings: dict[str, Any], raw_work_item: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    if should_run_preflight(raw_work_item):
+        normalized = normalize_with_devin(settings, raw_work_item)
+        if not normalized.get("is_security_related", True):
+            return normalized, True
+        work_item = {
+            **normalized,
+            "event_type": raw_work_item.get("event_type"),
+            "event_phase": "normalized",
+            "source": raw_work_item["source"],
+            "title": raw_work_item["title"],
+            "body": raw_work_item["body"],
+            "labels": raw_work_item.get("labels", []),
+            "created_at": raw_work_item.get("created_at") or utc_now(),
+            "canonical_issue_number": raw_work_item.get("canonical_issue_number"),
+            "family_key": normalized.get("family_key") or raw_work_item.get("family_key"),
+        }
+        if not work_item.get("canonical_issue_body"):
+            work_item["canonical_issue_body"] = canonical_issue_body_from_work_item(work_item)
+        return work_item, False
+
+    work_item = seed_work_item_from_raw(raw_work_item, load_test_tier_matrix())
+    if not work_item.get("created_at"):
+        work_item["created_at"] = utc_now()
+    return work_item, False
 
 
 def ensure_tracking_issue(settings: dict[str, Any], work_item: dict[str, Any]) -> dict[str, Any]:
@@ -277,12 +321,88 @@ def list_project_sessions(settings: dict[str, Any], phase: str | None = None) ->
     return payload.get("items") or payload.get("sessions") or []
 
 
+def has_active_discovery_session(settings: dict[str, Any]) -> bool:
+    for session in list_project_sessions(settings, phase="discovery"):
+        if session.get("status") in {"new", "creating", "claimed", "running", "resuming", "waiting_for_user"}:
+            return True
+    return False
+
+
 def count_active_remediation_sessions(settings: dict[str, Any]) -> int:
     count = 0
     for session in list_project_sessions(settings, phase="remediation"):
         if session.get("status") in {"new", "creating", "claimed", "running", "resuming"}:
             count += 1
     return count
+
+
+def has_active_remediation_session_for_issue(settings: dict[str, Any], issue_number: int) -> bool:
+    issue_tag = f"issue:{issue_number}"
+    for session in list_project_sessions(settings, phase="remediation"):
+        if issue_tag not in (session.get("tags") or []):
+            continue
+        if session.get("status") in {"new", "creating", "claimed", "running", "resuming"}:
+            return True
+    return False
+
+
+def _discovery_lock_key() -> str:
+    return "locks/discovery.lock"
+
+
+def acquire_discovery_lock(settings: dict[str, Any], holder: str, ttl_seconds: int) -> bool:
+    bucket = settings.get("metrics_bucket")
+    if not bucket:
+        return True
+    key = _discovery_lock_key()
+    payload = json.dumps(
+        {
+            "holder": holder,
+            "created_at": utc_now(),
+            "expires_at": utc_now() + ttl_seconds,
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+    try:
+        s3_client.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=payload,
+            ContentType="application/json",
+            IfNoneMatch="*",
+        )
+        return True
+    except Exception as exc:  # boto3/botocore may not be importable in local unit tests
+        response = getattr(exc, "response", {}) or {}
+        code = str(response.get("Error", {}).get("Code", ""))
+        if code not in {"PreconditionFailed", "ConditionalRequestConflict"}:
+            raise
+    try:
+        current = s3_client.get_object(Bucket=bucket, Key=key)
+        lock_payload = json.loads(current["Body"].read().decode("utf-8"))
+    except Exception:
+        return False
+    if int(lock_payload.get("expires_at", 0)) > utc_now():
+        return False
+    s3_client.delete_object(Bucket=bucket, Key=key)
+    s3_client.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=payload,
+        ContentType="application/json",
+        IfNoneMatch="*",
+    )
+    return True
+
+
+def release_discovery_lock(settings: dict[str, Any]) -> None:
+    bucket = settings.get("metrics_bucket")
+    if not bucket:
+        return
+    try:
+        s3_client.delete_object(Bucket=bucket, Key=_discovery_lock_key())
+    except Exception:
+        return
 
 
 def launch_remediation_session(settings: dict[str, Any], work_item: dict[str, Any]) -> dict[str, Any]:
@@ -322,7 +442,7 @@ def launch_remediation_session(settings: dict[str, Any], work_item: dict[str, An
         token=token,
         payload={
             "body": (
-                "AWS remediation worker launched a Devin session.\n\n"
+                "AWS remediation worker launched Devin as the end-to-end remediation operator for this work item.\n\n"
                 f"- Session ID: `{session['session_id']}`\n"
                 f"- Scope tier: `{work_item['scope_tier']}`\n"
                 f"- Automation decision: `{work_item['automation_decision']}`\n"

@@ -1,11 +1,14 @@
 PYTHON ?= python3
 
-.PHONY: simulate discover issues launch poll report deploy-aws test invoke-manual invoke-linear
+.PHONY: simulate discover discover-devin issues launch poll report deploy-aws test invoke-manual invoke-linear
 
 simulate: discover issues poll report
 
 discover:
 	$(PYTHON) scripts/scan_or_import_findings.py
+
+discover-devin:
+	$(PYTHON) scripts/run_devin_discovery.py
 
 issues:
 	$(PYTHON) scripts/create_issues.py

@@ -6,6 +6,7 @@ APP_NAME="${APP_NAME:-devin-vuln-automation}"
 REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 QUEUE_DELAY_SECONDS="${QUEUE_DELAY_SECONDS:-30}"
+DISCOVERY_SCHEDULE="${DISCOVERY_SCHEDULE:-rate(2 hours)}"
 QUEUE_NAME="${APP_NAME}-buffer.fifo"
 DLQ_NAME="${APP_NAME}-dlq.fifo"
 SECRET_NAME="${APP_NAME}-runtime"
@@ -99,6 +100,9 @@ print(json.dumps({
     "TARGET_REPO_NAME": os.environ.get("TARGET_REPO_NAME", "superset-remediation"),
     "AWS_METRICS_BUCKET": "${BUCKET_NAME}",
     "MAX_ACTIVE_REMEDIATIONS": 2,
+    "MAX_DISCOVERY_FINDINGS": 1,
+    "DISCOVERY_TIMEOUT_SECONDS": 900,
+    "DISCOVERY_LOCK_TTL_SECONDS": 5400,
     "DEVIN_BYPASS_APPROVAL": "false",
 }))
 PY
@@ -162,7 +166,8 @@ aws iam put-role-policy \
       "Effect": "Allow",
       "Action": [
         "s3:PutObject",
-        "s3:GetObject"
+        "s3:GetObject",
+        "s3:DeleteObject"
       ],
       "Resource": "arn:aws:s3:::${BUCKET_NAME}/*"
     }
@@ -175,7 +180,7 @@ echo "Packaging Lambda bundle..."
 python3 -m pip install --quiet -r "${ROOT_DIR}/requirements.txt" -t "${BUILD_DIR}"
 cp -R "${ROOT_DIR}/config" "${BUILD_DIR}/config"
 cp -R "${ROOT_DIR}/scripts" "${BUILD_DIR}/scripts"
-cp "${ROOT_DIR}/common.py" "${ROOT_DIR}/aws_runtime.py" "${ROOT_DIR}/lambda_intake.py" "${ROOT_DIR}/lambda_worker.py" "${ROOT_DIR}/lambda_poller.py" "${BUILD_DIR}/"
+cp "${ROOT_DIR}/common.py" "${ROOT_DIR}/aws_runtime.py" "${ROOT_DIR}/lambda_intake.py" "${ROOT_DIR}/lambda_worker.py" "${ROOT_DIR}/lambda_poller.py" "${ROOT_DIR}/lambda_discovery.py" "${BUILD_DIR}/"
 (cd "${BUILD_DIR}" && zip -qr "${ZIP_PATH}" .)
 
 ROLE_ARN="$(aws iam get-role --role-name "${ROLE_NAME}" --query 'Role.Arn' --output text)"
@@ -225,6 +230,7 @@ deploy_lambda () {
 deploy_lambda "${APP_NAME}-intake" "lambda_intake.handler" 300 512
 deploy_lambda "${APP_NAME}-worker" "lambda_worker.handler" 180 256
 deploy_lambda "${APP_NAME}-poller" "lambda_poller.handler" 300 256
+deploy_lambda "${APP_NAME}-discovery" "lambda_discovery.handler" 900 256
 
 if ! aws lambda list-event-source-mappings \
   --region "${REGION}" \
@@ -279,6 +285,38 @@ if ! aws lambda get-policy --region "${REGION}" --function-name "${APP_NAME}-pol
     --source-arn "arn:aws:events:${REGION}:${ACCOUNT_ID}:rule/${RULE_NAME}" >/dev/null || true
 fi
 
+DISCOVERY_RULE_NAME="${APP_NAME}-discovery-schedule"
+aws events put-rule \
+  --region "${REGION}" \
+  --name "${DISCOVERY_RULE_NAME}" \
+  --schedule-expression "${DISCOVERY_SCHEDULE}" >/dev/null
+
+DISCOVERY_ARN="$(aws lambda get-function --region "${REGION}" --function-name "${APP_NAME}-discovery" --query 'Configuration.FunctionArn' --output text)"
+aws events put-targets \
+  --region "${REGION}" \
+  --rule "${DISCOVERY_RULE_NAME}" \
+  --targets "$(python3 - <<PY
+import json
+print(json.dumps([
+    {
+        "Id": "1",
+        "Arn": "${DISCOVERY_ARN}",
+        "Input": json.dumps({"event_type": "scheduled_discovery", "max_findings": 1}),
+    }
+]))
+PY
+)" >/dev/null
+
+if ! aws lambda get-policy --region "${REGION}" --function-name "${APP_NAME}-discovery" >/dev/null 2>&1 || ! aws lambda get-policy --region "${REGION}" --function-name "${APP_NAME}-discovery" --query 'Policy' --output text | grep -q "${DISCOVERY_RULE_NAME}"; then
+  aws lambda add-permission \
+    --region "${REGION}" \
+    --function-name "${APP_NAME}-discovery" \
+    --statement-id "${DISCOVERY_RULE_NAME}" \
+    --action "lambda:InvokeFunction" \
+    --principal events.amazonaws.com \
+    --source-arn "arn:aws:events:${REGION}:${ACCOUNT_ID}:rule/${DISCOVERY_RULE_NAME}" >/dev/null || true
+fi
+
 FUNCTION_URL="$(aws lambda get-function-url-config --region "${REGION}" --function-name "${APP_NAME}-intake" --query FunctionUrl --output text)"
 GITHUB_WEBHOOK_SECRET="$(aws secretsmanager get-secret-value --region "${REGION}" --secret-id "${SECRET_NAME}" --query SecretString --output text | jq -r '.GITHUB_WEBHOOK_SECRET')"
 
@@ -303,6 +341,7 @@ Metrics bucket: ${BUCKET_NAME}
 Secrets Manager secret: ${SECRET_NAME}
 Lambda intake URL: ${FUNCTION_URL}
 GitHub webhook target: ${FUNCTION_URL}github
+Discovery schedule: ${DISCOVERY_SCHEDULE}
 
 Use these paths on the Lambda URL:
 - /github

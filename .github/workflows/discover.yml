@@ -23,7 +23,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Normalize findings
+      - name: Prepare upstream findings
         run: python scripts/scan_or_import_findings.py
 
       - name: Create GitHub work items

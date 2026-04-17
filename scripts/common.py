@@ -164,6 +164,88 @@ def derive_family_key(title: str, labels: list[str] | None = None) -> str:
     return slugify(title)[:64] or "generic-work-item"
 
 
+def _first_nonempty_line(text: str) -> str:
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return ""
+
+
+def should_run_preflight(raw_work_item: dict[str, Any]) -> bool:
+    source = raw_work_item.get("source", {})
+    event_type = str(raw_work_item.get("event_type", "")).lower()
+    if source.get("type") == "linear_ticket":
+        return True
+    return event_type in {
+        "scheduled_discovery",
+        "devin_discovery",
+        "discovery",
+        "repo_review",
+    }
+
+
+def seed_work_item_from_raw(raw_work_item: dict[str, Any], test_matrix: dict[str, Any]) -> dict[str, Any]:
+    tiers = test_matrix.get("tiers") or {}
+    title = raw_work_item.get("title") or "Remediation work item"
+    body = raw_work_item.get("body") or ""
+    labels = list(raw_work_item.get("labels") or [])
+    source = raw_work_item.get("source") or {}
+    text = " ".join([title, body, " ".join(labels)]).lower()
+    if any(token in text for token in ["npm audit", "dependabot", "pip-audit", "ghsa-", "cve-", "package-lock", "requirements"]):
+        tier = "tier0_auto_dependency_patch"
+    else:
+        tier = "tier1_auto_targeted_runtime"
+    tier_defaults = tiers.get(tier, {})
+    source_type = source.get("type", "unknown")
+
+    problem_statement = _first_nonempty_line(body) or title
+    if problem_statement != title:
+        problem_statement = f"{title}: {problem_statement}"
+
+    issue_labels = list(dict.fromkeys(labels + ["devin-remediate"]))
+    if is_security_related(title, body, labels) and "security-remediation" not in issue_labels:
+        issue_labels.append("security-remediation")
+    if source_type == "manual_endpoint" and "manual-source" not in issue_labels:
+        issue_labels.append("manual-source")
+
+    likely_touched_files = []
+    impacted_surface = []
+    if tier == "tier0_auto_dependency_patch":
+        likely_touched_files = ["package.json", "package-lock.json", "requirements.txt"]
+        impacted_surface = ["Dependency manifests and lockfiles", "The runtime surface affected by the vulnerable dependency"]
+    else:
+        impacted_surface = ["Repository surface to be confirmed by the Devin remediation session"]
+
+    work_item = {
+        "event_type": raw_work_item.get("event_type"),
+        "event_phase": "seeded",
+        "source": source,
+        "title": title,
+        "body": body,
+        "labels": labels,
+        "created_at": raw_work_item.get("created_at"),
+        "canonical_issue_number": raw_work_item.get("canonical_issue_number"),
+        "family_key": raw_work_item.get("family_key") or derive_family_key(title, labels),
+        "problem_statement": problem_statement,
+        "summary": f"Seeded directly from `{source_type}` for a broad Devin remediation session.",
+        "scope_tier": tier,
+        "automation_decision": tier_defaults.get("automation_decision", "auto"),
+        "confidence": "medium" if is_security_related(title, body, labels) else "low",
+        "canonical_issue_title": title,
+        "issue_labels": issue_labels,
+        "test_plan": {
+            "commands": list(tier_defaults.get("commands") or []),
+            "manual_checks": list(tier_defaults.get("manual_checks") or []),
+            "impacted_surface": impacted_surface,
+            "likely_touched_files": likely_touched_files,
+            "requires_new_tests": bool(tier_defaults.get("requires_new_tests", False)),
+        },
+    }
+    work_item["canonical_issue_body"] = canonical_issue_body_from_work_item(work_item)
+    return work_item
+
+
 def build_issue_body(finding: dict[str, Any]) -> str:
     package_name = finding["package"]
     ecosystem = finding["ecosystem"]
@@ -249,8 +331,9 @@ def canonical_issue_body_from_work_item(work_item: dict[str, Any]) -> str:
         [
             "",
             "## Notes",
-            "- This issue was normalized by the automation control plane before remediation.",
-            "- Devin is expected to use the scoped test plan and stay within the identified surface area.",
+            "- This issue was shaped by the automation control plane to seed the Devin remediation loop.",
+            "- Devin owns the engineering work: investigation, validation, code change, and PR creation.",
+            "- The scoped test plan is guidance, but Devin should refine it if repository evidence requires a safer narrow adjustment.",
         ]
     )
     return "\n".join(lines)
@@ -300,16 +383,35 @@ def build_remediation_prompt_from_work_item(
     manual_checks = test_plan.get("manual_checks") or []
     touched_files = test_plan.get("likely_touched_files") or []
     impacted_surface = test_plan.get("impacted_surface") or []
+    source = work_item.get("source", {})
     commands_text = "\n".join(f"- `{item}`" for item in commands) or "- Use the narrowest credible validation available."
     manual_text = "\n".join(f"- {item}" for item in manual_checks) or "- None."
     files_text = "\n".join(f"- `{item}`" for item in touched_files) or "- Manifest and lockfile only unless required."
     surface_text = "\n".join(f"- {item}" for item in impacted_surface) or "- Scope not explicitly mapped."
+    labels_text = "\n".join(f"- `{item}`" for item in (work_item.get("labels") or [])) or "- None."
+    raw_body = work_item.get("body") or "- No raw event body provided."
+    issue_body = issue.get("body") or "- No canonical issue body available."
 
-    return f"""You are remediating a scoped work item in the repository `{owner}/{repo}`.
+    return f"""You are the end-to-end remediation operator for a scoped engineering work item in `{owner}/{repo}`.
 
 Repository to work in: {repo_clone_url}
 Issue number: #{issue["number"]}
 Issue title: {issue["title"]}
+
+Source event:
+- Type: `{source.get('type', 'unknown')}`
+- Action: `{source.get('action', 'unknown')}`
+- Source id: `{source.get('id', 'unknown')}`
+- Source url: {source.get('url', 'n/a')}
+
+Source labels:
+{labels_text}
+
+Raw event body:
+{raw_body}
+
+Canonical issue body:
+{issue_body}
 
 Normalized problem statement:
 {work_item["problem_statement"]}
@@ -332,17 +434,24 @@ Manual checks to mention if you need approval:
 {manual_text}
 
 Requirements:
-1. Stay within the scoped surface area unless you discover a blocker that requires expansion.
-2. Make the smallest safe fix that resolves the issue.
-3. Run the required validation commands when possible and report exact results.
-4. If the scope tier implies manual approval or the change becomes riskier than expected, stop and explain why.
-5. Open a pull request against the default branch of `{owner}/{repo}` if the work can be completed safely.
+1. Investigate whether the issue is actionable in this repository before making changes.
+2. Treat the provided scope and test plan as preflight guidance, but refine them if repository evidence supports a safer narrow adjustment.
+3. Stay within the smallest safe surface area unless you discover a blocker that requires explicit expansion.
+4. Make the smallest safe fix that resolves the issue.
+5. Run the required validation commands when possible, and report exact results plus any gaps.
+6. If the issue is not actionable, if the scope tier implies manual approval, or if the change becomes riskier than expected, stop and explain why.
+7. Open a pull request against the default branch of `{owner}/{repo}` if the work can be completed safely.
+
+Output expectations:
+- You own the engineering loop for this work item: investigation, fix selection, validation, and PR/reporting.
+- If you stop, explain the blocker or manual-review reason clearly.
+- Do not broaden scope into unrelated refactors.
 """
 
 
 def build_normalization_prompt(work_item: dict[str, Any], test_matrix: dict[str, Any], repo_clone_url: str) -> str:
     matrix_text = json.dumps(test_matrix, indent=2, sort_keys=True)
-    return f"""You are acting as a normalization and scoping engine for an event-driven remediation pipeline.
+    return f"""You are performing preflight scoping for an event-driven Devin remediation pipeline.
 
 Repository under consideration: {repo_clone_url}
 
@@ -353,11 +462,11 @@ Testing tier matrix:
 {matrix_text}
 
 Your job:
-1. Convert the raw event into a concise problem statement.
+1. Convert the raw event into an initial problem statement for a downstream remediation session.
 2. Determine whether the work item is security or vulnerability related.
-3. Assign the best fitting scope tier from the provided testing matrix.
-4. Decide whether the remediation can be fully automated or requires manual approval.
-5. Produce a concrete test plan with the narrowest credible validation commands.
+3. Assign the best fitting initial scope tier from the provided testing matrix.
+4. Decide whether the remediation is a good candidate for autonomous execution or should default to manual approval.
+5. Produce an initial test plan with the narrowest credible validation commands.
 6. Identify likely touched files and impacted surfaces.
 7. Produce a canonical GitHub issue title/body if one should be created or updated.
 
@@ -365,6 +474,42 @@ Important constraints:
 - Prefer conservative scoping over aggressive automation.
 - If confidence is low, choose a more cautious tier and require manual approval.
 - Keep the work item tightly bounded; do not invent broad refactors.
+- You are producing preflight guidance, not the final engineering decision. The downstream Devin remediation session will re-evaluate repository reality before acting.
+"""
+
+
+def build_discovery_prompt(
+    owner: str,
+    repo: str,
+    repo_clone_url: str,
+    max_findings: int,
+) -> str:
+    return f"""You are performing a bounded discovery review for `{owner}/{repo}`.
+
+Repository to inspect: {repo_clone_url}
+
+Goal:
+- Find at most {max_findings} actionable security or vulnerability remediation candidates.
+
+Requirements:
+1. Only report findings that are strongly supported by repository evidence or deterministic dependency/security evidence.
+2. Prefer concrete dependency vulnerabilities, unsafe configuration, or clearly actionable security flaws over speculative concerns.
+3. Validate that each finding is real enough to justify creating a tracked GitHub issue.
+4. If you are not confident a finding is real and actionable, do not include it.
+5. Keep the list short and high signal. Returning zero findings is acceptable.
+
+For each finding you include:
+- Provide a concise title and problem statement.
+- State the evidence and why it is actionable in this repository.
+- Suggest the smallest safe remediation scope.
+- Choose an initial scope tier and automation decision.
+- Provide a narrow validation plan.
+- Include labels that would make sense on a tracked GitHub issue.
+
+Important constraints:
+- Do not propose broad refactors.
+- Do not include hypothetical or weakly supported issues.
+- Prefer fewer, higher-confidence findings over many marginal ones.
 """
 
 
@@ -444,6 +589,78 @@ def normalization_output_schema() -> dict[str, Any]:
             "issue_labels",
             "test_plan",
         ],
+    }
+
+
+def discovery_output_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "summary": {"type": "string"},
+            "findings": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "id": {"type": "string"},
+                        "title": {"type": "string"},
+                        "problem_statement": {"type": "string"},
+                        "evidence": {"type": "string"},
+                        "confidence": {"type": "string"},
+                        "scope_tier": {"type": "string"},
+                        "automation_decision": {"type": "string"},
+                        "issue_labels": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "test_plan": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "commands": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                },
+                                "manual_checks": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                },
+                                "impacted_surface": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                },
+                                "likely_touched_files": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                },
+                                "requires_new_tests": {"type": "boolean"},
+                            },
+                            "required": [
+                                "commands",
+                                "manual_checks",
+                                "impacted_surface",
+                                "likely_touched_files",
+                                "requires_new_tests",
+                            ],
+                        },
+                    },
+                    "required": [
+                        "id",
+                        "title",
+                        "problem_statement",
+                        "evidence",
+                        "confidence",
+                        "scope_tier",
+                        "automation_decision",
+                        "issue_labels",
+                        "test_plan",
+                    ],
+                },
+            },
+        },
+        "required": ["summary", "findings"],
     }
 
 
