@@ -8,3 +8,11 @@ state/*.json
 build/
 dist/
 *.zip
+terraform/.terraform/
+terraform/bootstrap/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/bootstrap/*.tfstate
+terraform/bootstrap/*.tfstate.*
+terraform/live.auto.tfvars.json
+*.tfplan

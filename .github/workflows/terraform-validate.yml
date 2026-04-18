@@ -1,0 +1,80 @@
+name: terraform-validate
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate Terraform migration
+    runs-on: ubuntu-latest
+    env:
+      APP_NAME: devin-vuln-automation
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
+      DEVIN_ORG_ID: ${{ secrets.DEVIN_ORG_ID }}
+      GH_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve Terraform backend names
+        run: |
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          echo "TF_STATE_BUCKET=${APP_NAME}-terraform-state-${ACCOUNT_ID}-${AWS_REGION}" >> "${GITHUB_ENV}"
+          echo "TF_LOCK_TABLE=${APP_NAME}-terraform-locks" >> "${GITHUB_ENV}"
+
+      - name: Build Lambda bundle
+        run: bash terraform/scripts/build_lambda_bundle.sh "${GITHUB_WORKSPACE}" "${GITHUB_WORKSPACE}/build/${APP_NAME}.zip"
+
+      - name: Render live Terraform variables
+        run: python3 terraform/scripts/render_live_tfvars.py > terraform/live.auto.tfvars.json
+
+      - name: Terraform fmt
+        run: |
+          terraform -chdir=terraform fmt -check -recursive
+          terraform -chdir=terraform/bootstrap fmt -check -recursive
+
+      - name: Terraform validate
+        run: |
+          terraform -chdir=terraform/bootstrap init -backend=false -input=false
+          terraform -chdir=terraform/bootstrap validate
+          terraform -chdir=terraform init -backend=false -input=false
+          terraform -chdir=terraform validate
+
+      - name: Bootstrap Terraform backend
+        run: |
+          terraform -chdir=terraform/bootstrap init -input=false
+          terraform -chdir=terraform/bootstrap apply -auto-approve -input=false \
+            -var="aws_region=${AWS_REGION}" \
+            -var="app_name=${APP_NAME}" \
+            -var="lock_table_name=${TF_LOCK_TABLE}"
+
+      - name: Initialize Terraform
+        run: |
+          terraform -chdir=terraform init -input=false \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="key=prod/terraform.tfstate" \
+            -backend-config="region=${AWS_REGION}" \
+            -backend-config="dynamodb_table=${TF_LOCK_TABLE}" \
+            -backend-config="encrypt=true"
+
+      - name: Import live AWS stack
+        run: bash terraform/scripts/import_live_stack.sh
+
+      - name: Terraform plan
+        run: terraform -chdir=terraform plan -input=false -out=tfplan
