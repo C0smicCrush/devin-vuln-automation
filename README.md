@@ -75,7 +75,15 @@ That split keeps the control plane thin and makes Devin the owner of the enginee
 
 ## Event Sources
 
-The architecture supports five event-source classes.
+There is exactly one ingress to the remediation pipeline: a **GitHub issue labeled `devin-remediate`**. Everything listed below is a **producer** of that event, not a separate pipeline. Humans, Linear bridges, manual POSTs, scheduled scanners, and scheduled Devin discovery runs all converge on the same ingress and flow through a single path: webhook → intake → SQS → worker → Devin remediation → PR.
+
+This gives the system one ingress to harden, one dedup boundary (issue number + `finding:<id>`), one append-only event log per work item (the issue and its comments), and a pluggable producer surface — new sources slot in as additional arrows into the ingress without changing anything downstream.
+
+Once a tracked issue or PR exists, **new human comments on that issue or PR** also become first-class follow-up events. Those comments do not create a second pipeline; they re-enter the same control plane as ambiguous follow-up work items, and the next Devin remediation session itself decides whether they should:
+
+- get ignored as non-actionable chatter
+- pause for manual review
+- launch a bounded remediation follow-up tied to the same issue family
 
 ### 1. GitHub issue events
 
@@ -131,11 +139,13 @@ Examples:
 
 This is how Devin can "find issues itself." A scheduler or operator triggers a discovery run, Devin emits structured findings, and those findings become issues or remediation events.
 
-The hosted stack now includes an EventBridge-driven discovery schedule:
+The hosted stack includes an EventBridge-driven discovery schedule. EventBridge here is used strictly as a **dumb cron** — it wakes the discovery producer on a timer and is not otherwise involved in the pipeline:
 
-- EventBridge rule: every `2 hours`
+- EventBridge rule: `rate(1 day)` (also manually invokable via `aws lambda invoke`)
 - target: `devin-vuln-automation-discovery`
 - default input: `{"event_type":"scheduled_discovery","max_findings":1}`
+
+Discovery's only output is a GitHub issue with `devin-remediate` and `finding:<id>`. From that point forward it flows through the same path as any other issue. Discovery does not have its own remediation lane.
 
 ### Bounded discovery driver
 
@@ -156,23 +166,52 @@ By default it is intentionally conservative:
 ## Architecture
 
 ```mermaid
-flowchart TD
-    github[GitHub Issue Event] --> intake[Lambda Intake]
-    linear[Linear Ticket Event] --> intake
-    manual[Manual API Event] --> intake
-    scanner[Scheduled Scanner Finding] --> intake
-    discovery[EventBridge Scheduled Discovery] --> discoverylambda[Discovery Lambda]
-    discoverylambda --> discoveryissue[GitHub Issue Created]
-    discoveryissue --> github
-    intake --> buffer[SQS FIFO Buffer]
-    buffer --> worker[Lambda Worker]
-    worker --> devin[Devin Remediation Session]
-    devin --> pr[Pull Request]
-    devin --> issue[Issue Updates]
-    poller[Scheduled Poller] --> devin
-    poller --> metrics[S3 Metrics Snapshot]
-    poller --> logs[CloudWatch Logs]
+flowchart LR
+    hum["Human"]
+    lin["Linear bridge"]
+    man["Manual POST"]
+    dis["Discovery λ"]
+    ic["Issue comment"]
+    pc["PR comment"]
+
+    cron["EventBridge<br/>rate(1d) + on-demand"]
+
+    iss[("GitHub issue<br/>+devin-remediate<br/>(single ingress)")]
+
+    wh["Intake λ"]
+    sqs[("SQS FIFO<br/>30s delay")]
+    wrk["Worker λ"]
+    dev[["Devin remediation"]]
+    ver[["Devin verification"]]
+    pr[("Draft PR<br/>+ receipts + review")]
+
+    pol["Poller 5m"]
+    met[("S3 metrics + CloudWatch")]
+
+    cron --> dis
+    hum --> iss
+    lin --> iss
+    man --> iss
+    dis --> iss
+    ic --> wh
+    pc --> wh
+
+    iss -->|webhook| wh --> sqs --> wrk
+    wrk --> dev
+    dev --> pr
+    pr --> ver
+    ver --> pr
+    wrk --> iss
+    dev --> iss
+
+    pol --> dev
+    pol --> ver
+    pol --> iss
+    pol --> pr
+    pol --> met
 ```
+
+Read it left-to-right: **root producers create tracked issues, then comments on those tracked issues/PRs create follow-up events through the same control plane.** Discovery is just another producer whose job happens to be "use a bounded Devin session to decide what issues to file." The pipeline does not know or care who filed any given issue, and it treats human follow-up comments as serialized continuation events rather than a separate workflow.
 
 ## End-To-End Flow
 
@@ -183,17 +222,22 @@ flowchart TD
 5. The worker applies guardrails such as concurrency limits and manual-review policy.
 6. The worker launches one broad Devin session for the work item.
 7. Devin investigates the issue, chooses the remediation strategy, validates its work, and opens or updates a PR if appropriate.
-8. Poller Lambda tracks the session and writes status back to GitHub and S3.
+8. A second Devin verification session reviews the PR, independently checks whether it actually fixes the issue, and writes its verdict to the PR and linked issue.
+9. Poller Lambda tracks the remediation / verification sessions and writes deduped status back to GitHub and S3.
 
-For `linear_ticket` inputs and explicit discovery-mode events, the worker can still route through a lightweight preflight scoping step first. For GitHub issues, manual remediation payloads, and scanner-shaped findings, the default path is now one broad Devin remediation session.
+All tracked work items now use the same core path. The worker shapes a lightweight canonical work item, launches one broad Devin remediation session, and that single session decides whether to ignore the input, stop for manual review, ask a human question, or continue into implementation.
 
-For scheduled Devin discovery, the flow is slightly different:
+### Scheduled Devin discovery (a producer, not a separate pipeline)
 
-1. EventBridge invokes `devin-vuln-automation-discovery`.
-2. Discovery Lambda acquires the discovery lease and checks for an already-active discovery session.
-3. Discovery Lambda launches one bounded Devin discovery session.
-4. If Devin returns a high-confidence finding, Discovery Lambda creates a labeled GitHub issue.
-5. That issue then enters the normal GitHub webhook -> intake -> SQS -> worker remediation path.
+Discovery is an issue producer. Its output is a GitHub issue; from there it uses the exact same flow above:
+
+1. EventBridge (daily cron, also manually invokable) triggers `devin-vuln-automation-discovery`.
+2. Discovery Lambda acquires an S3 lease and checks for any already-active discovery session.
+3. Discovery Lambda launches one bounded Devin discovery session (`max_acu_limit: 1`).
+4. For each high-confidence, deduped finding, Discovery Lambda creates a GitHub issue labeled `devin-remediate` + `finding:<id>`.
+5. That issue fires the webhook and re-enters the main flow at step 1 above — no special casing.
+
+This is deliberate. Any future issue producer (Trivy webhook, pip-audit cron, Sentry bridge) slots in the same way: it files an issue and the pipeline consumes it identically.
 
 ## Canonical Event Model
 
@@ -424,7 +468,7 @@ The deployment script:
 - creates the Lambda Function URL
 - wires SQS to the worker
 - schedules the poller
-- schedules EventBridge discovery every 2 hours
+- schedules EventBridge discovery daily (`rate(1 day)`; also manually invokable)
 - can wire GitHub issue webhooks for the target repo
 
 Supported intake paths:
@@ -502,12 +546,18 @@ Key metrics include:
 - blocked or manual-review sessions
 - failed sessions
 - PRs opened by Devin
+- tracked items verified
+- tracked items verified in first pass
+- tracked items that required human follow-up
+- tracked items with multiple remediation loops
+- total accepted human comment follow-ups
+- verification verdict counts (`verified`, `partially_fixed`, `not_fixed`, `not_verified`)
 
 ## Trade-Offs
 
 - Scanner findings are more deterministic than pure Devin discovery, so both should exist.
 - FIFO buffering improves local ordering but increases time-to-remediation during bursts.
-- Keeping preflight limited to Linear and discovery-mode inputs preserves a clean main loop while retaining a safety valve for noisier sources.
+- Keeping the control plane thin means the worker only canonicalizes transport-level input. Devin owns the triage decision inside the single remediation session.
 - Tight concurrency limits protect both AWS cost and the target repo, but reduce throughput.
 - GitHub is the best audit surface for reviewers, even when the original signal came from somewhere else.
 

@@ -203,7 +203,23 @@ Yes, but only in response to an upstream trigger. Devin can be the finding gener
 
 ## Event Sources and Triggers
 
-The system should explicitly support the following event sources.
+There is exactly one ingress to the remediation pipeline: a GitHub issue labeled `devin-remediate`. Everything in this section is a **producer** of that event — not a separate pipeline. A human, a Linear bridge, a manual POST, a scheduled scanner, or a scheduled Devin discovery run all converge on the same `IssueCreated(devin-remediate)` event, which then flows through a single path: webhook → intake → SQS → worker → Devin remediation → PR.
+
+This is deliberate. It gives the system:
+
+- one ingress to harden, authenticate, rate-limit, and observe
+- one dedup boundary (issue number + `finding:<id>` label)
+- one append-only event log per work item (the issue and its comments)
+- a pluggable producer surface: new sources (Trivy webhook, pip-audit cron, Sentry alert, etc.) slot in as additional arrows into the ingress without changing anything downstream
+
+The sections below describe each producer and the role it plays, but none of them are architecturally privileged.
+
+After a tracked issue or PR exists, the system also treats **new human comments on that issue or PR** as follow-up workflow inputs. These are not new root producers of tracked issues; they are serialized continuation events on an existing work item. They re-enter through intake and are handled by the same broad remediation session, which can result in one of four outcomes:
+
+- ignored as non-actionable chatter
+- paused for manual review
+- paused pending a narrow human answer
+- launched as a bounded remediation follow-up tied to the same issue family
 
 ## 1. GitHub issue events
 
@@ -319,8 +335,9 @@ Why this source exists:
 
 Current status:
 
-- deployed in AWS with EventBridge on a 2-hour cadence
+- deployed in AWS with EventBridge as a dumb cron on a daily cadence (`rate(1 day)`) plus on-demand manual invoke
 - bounded by default to one discovery finding per run
+- output is always a GitHub issue with `devin-remediate` — discovery does not have its own path into remediation; it re-enters through the same ingress any other producer uses
 
 Recommended role:
 
@@ -360,7 +377,7 @@ Deployed or intended resources:
 - discovery Lambda
 - Secrets Manager
 - S3 bucket for status snapshots
-- EventBridge for scheduled sources, including the 2-hour bounded discovery trigger
+- EventBridge as a dumb cron for scheduled producers (daily discovery by default; cron-only, not an event bus)
 
 AWS is responsible for transport, policy, and observability. It should not become the engineering decision-maker.
 
@@ -451,65 +468,56 @@ Devin should not:
 
 ## End-to-End Lifecycle
 
-At the highest level, the target lifecycle should look like this:
+There is one pipeline. Every work item flows through it identically, regardless of who produced the triggering issue:
 
-1. An event is created by a human, tool, scheduler, or Devin discovery run.
-2. Intake Lambda receives the event and wraps it in a canonical event envelope.
-3. The envelope is buffered in SQS FIFO with a family-specific message group.
-4. Worker Lambda consumes the message when eligible.
-5. Worker Lambda launches one broad Devin session for that work item.
-6. Devin investigates the issue, scopes it, validates it, fixes it if appropriate, and opens or updates a PR.
-7. Poller Lambda tracks the Devin session and writes status back to GitHub and S3.
-8. Metrics and logs show whether the system is progressing, blocked, or failing.
+1. A producer (human, Linear bridge, manual POST, scheduled scanner, or scheduled Devin discovery) creates a GitHub issue labeled `devin-remediate`.
+2. The GitHub webhook fires and Intake Lambda wraps it in a canonical event envelope.
+3. The envelope is buffered in SQS FIFO with a family-specific message group (30s delay for coalescing).
+4. Worker Lambda consumes the message when eligible, after dedup checks against active Devin sessions on the same issue.
+5. Worker Lambda launches one broad Devin remediation session for that work item.
+6. Devin investigates the issue, scopes it, validates it, fixes it if appropriate, and opens a normal PR with `scanner_before` / `scanner_after` / `tests` receipts.
+7. A second Devin verification session reviews the PR, independently tests whether the PR actually fixes the issue, and writes its verdict to the PR and linked issue.
+8. Poller Lambda tracks remediation / verification sessions and writes deduped status back to GitHub and S3.
+9. Metrics and logs show whether the system is progressing, blocked, needs human follow-up, or has converged.
 
-This is the target operating model because it makes Devin the owner of the end-to-end engineering loop.
+This is the target operating model because it makes Devin the owner of the end-to-end engineering loop, and it means there is exactly one path to reason about.
 
-For scheduled discovery, the lifecycle is slightly different:
+### Where scheduled Devin discovery fits in
 
-1. EventBridge invokes `lambda_discovery.py`.
+Discovery is not a separate pipeline. It is an **issue producer** — one of several — whose job is to use a bounded Devin session to decide what issues to file. Concretely:
+
+1. EventBridge (a dumb cron, `rate(1 day)` by default, also manually invokable) triggers `lambda_discovery.py`.
 2. Discovery Lambda acquires a short-lived S3 lease and checks for an already-active discovery session.
 3. Discovery Lambda launches one bounded Devin discovery session.
-4. High-confidence findings are turned into GitHub issues.
-5. Those issues then flow through the standard GitHub webhook -> intake -> SQS -> worker remediation path.
+4. High-confidence findings are turned into GitHub issues labeled `devin-remediate` (plus `finding:<id>` for dedup).
+5. From that point forward, those issues flow through the main lifecycle above with no special casing. The pipeline does not know or care that the issue came from discovery instead of from a human.
 
-## Current Implementation Versus Target Model
+The same shape applies to any future producer: a `pip-audit` cron, a Trivy webhook, a Sentry alert bridge, etc. Each would land an issue with `devin-remediate` and re-enter the same path. No downstream code has to change.
 
-The current implementation now defaults to a broad single-session remediation path for actionable raw events:
+### Where human follow-up comments fit in
+
+Once a work item is in flight, the issue thread and PR thread become the human-Devin interface. A remediation or verification session may ask for narrowly scoped human information. When a human replies on the tracked issue or PR:
+
+1. GitHub emits an `issue_comment` or `pull_request_review_comment` webhook.
+2. Intake validates the comment, ignores automation-authored chatter, dedupes by `comment_id`, and resolves the comment back to the canonical tracked issue.
+3. The follow-up event is buffered with the same FIFO family key as the tracked issue.
+4. Worker Lambda launches another Devin remediation session against the same canonical issue family.
+5. That session decides whether the comment is actionable follow-up, ignorable chatter, a manual-review condition, or a narrow request for more human input.
+6. If actionable, the same session continues directly into bounded remediation work.
+
+This keeps the human/Devin conversation inside the same control plane rather than creating an ad hoc side channel.
+
+## Current Implementation
+
+The current implementation uses one Devin remediation session per tracked work item:
 
 - raw event arrives
 - worker creates or links a GitHub issue
+- worker builds a lightweight canonical work item in Python
 - worker launches one broad remediation-oriented Devin session
-- Devin re-evaluates the issue inside the repository before acting
+- that session decides whether to ignore the input, stop for manual review, ask a human question, or continue into implementation
 
-The implementation still keeps an optional preflight path for narrowly defined cases:
-
-- worker may call Devin for preflight scoping
-- worker creates or links a GitHub issue
-- worker may stop for manual review or later launch remediation
-
-That fallback is intentionally narrow: it is used for `linear_ticket` inputs and explicit discovery-mode events, not for standard GitHub issues, manual remediation payloads, or scanner-shaped findings.
-
-However, the better final framing for the take-home is:
-
-`one broad Devin task per remediation work item`
-
-In that target model, normalization still exists conceptually, but it is part of the Devin session rather than a separate first-class orchestration phase unless there is a good reason to split it.
-
-### When to keep a two-phase Devin flow
-
-A two-phase flow is still valid when:
-
-- the upstream event is a Linear-style ticket that needs extra scoping
-- human approval is required before code changes
-- the org wants a separate "scope-only" review step for discovery-mode work
-- discovery and remediation are intentionally separated for governance reasons
-
-### Default recommendation
-
-For this project, the default recommendation is:
-
-- use a single Devin remediation session for actionable work
-- reserve separate preflight-only sessions for `linear_ticket` and explicit discovery-mode cases
+Normalization still exists conceptually, but it is now part of the remediation session rather than a separate first-class orchestration phase.
 
 ## Canonical Event Envelope
 
@@ -616,6 +624,22 @@ This is a design choice, not an accident.
    - stops and marks the issue for manual review.
 9. Poller Lambda tracks the session and publishes updates.
 
+### Workflow A1: Human comment follow-up on a tracked issue or PR
+
+1. A human comments on a tracked issue or on a PR linked to a tracked issue.
+2. GitHub sends an `issue_comment` or `pull_request_review_comment` webhook.
+3. Intake validates the signature, ignores bot/control-plane comments, and dedupes the comment by `comment_id`.
+4. Intake resolves the canonical issue number for the comment and emits a follow-up raw event.
+5. The event enters SQS FIFO under the same issue family key.
+6. Worker Lambda launches another broad Devin remediation session tagged with the originating `comment:<id>`.
+7. That session decides whether the comment is:
+   - non-actionable and should be ignored
+   - a manual-review signal
+   - a narrow request for more human input
+   - actionable follow-up that justifies another remediation pass
+8. If actionable, the same session continues directly into bounded remediation work.
+9. Poller and verification continue to report only material state changes, so the human conversation remains visible without becoming noisy.
+
 ## Workflow B: Scheduled scanner finding to GitHub issue and remediation
 
 1. EventBridge starts a scheduled scanner job.
@@ -630,16 +654,18 @@ This is likely the strongest production-shaped path for vulnerability remediatio
 
 ## Workflow C: Scheduled Devin discovery run
 
-1. EventBridge creates a `scheduled_discovery` event.
+Discovery is an issue producer, not a separate remediation workflow. Its only output is GitHub issues; everything after that reuses Workflow A.
+
+1. EventBridge fires on a daily cadence (or an operator manually invokes `lambda_discovery`).
 2. Discovery Lambda acquires a lightweight S3-backed lease and checks for any already-active discovery session.
 3. If the lease is unavailable or a discovery session is already active, the run exits without launching Devin.
-4. Otherwise, Discovery Lambda launches Devin in bounded discovery mode.
+4. Otherwise, Discovery Lambda launches Devin in bounded discovery mode (`max_acu_limit: 1`).
 5. Devin inspects the repository for actionable findings within a specified scope.
-6. Devin returns structured findings.
-7. The control plane creates GitHub issues or remediation events from those findings.
-8. Those issues or events then go through the normal remediation path.
+6. Devin returns structured findings plus `rejected_findings` with reasons.
+7. High-confidence findings are filtered (confidence, automation decision, dedup against open issues) and turned into GitHub issues with `devin-remediate` and `finding:<id>` labels.
+8. From step 7 onward the flow is literally Workflow A with no modifications.
 
-This path is useful because it demonstrates proactive Devin usage, but it should be positioned as additive rather than as a replacement for deterministic scanners.
+This path is useful because it demonstrates proactive Devin usage, but it should be positioned as additive rather than as a replacement for deterministic scanners. Structurally it is interchangeable with any other issue producer.
 
 ## Workflow D: Manual demo run
 
@@ -785,7 +811,7 @@ Non-responsibilities:
 
 Current note:
 
-- the worker now defaults to launching a broad Devin remediation session for actionable events, with optional preflight scoping only for `linear_ticket` and explicit discovery-mode inputs.
+- the worker now launches a broad Devin remediation session for every tracked work item, and that single session owns both triage and implementation decisions.
 
 ## Poller Lambda
 
@@ -849,6 +875,12 @@ Useful metrics include:
 - PRs opened
 - average time from event to session launch
 - average time from launch to terminal state
+- tracked items verified
+- tracked items verified in first pass
+- tracked items requiring human follow-up
+- tracked items with multiple remediation loops
+- accepted human comment follow-ups
+- verification verdict counts by outcome
 
 The system does not need a large analytics platform for the take-home. It needs enough observability to prove that work is flowing and to diagnose where it is stuck.
 
@@ -940,7 +972,7 @@ Right now scanner outputs are real but still partially manual in how they enter 
 
 ### 2. The architecture should emphasize one broad Devin loop
 
-The implementation now defaults to a single broad Devin task for most actionable work items. The remaining gap is mostly narrative discipline: keep presenting preflight scoping as an optional fallback rather than as the main loop.
+The implementation now uses a single broad Devin task for tracked work items, including comment-driven follow-ups. The remaining work is mostly around proving the live end-to-end loop and keeping the GitHub status surface de-noised.
 
 ### 3. Scheduled Devin discovery is conceptually strong but not yet the primary validated path
 

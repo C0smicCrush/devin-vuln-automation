@@ -55,7 +55,6 @@ def main() -> int:
             "TARGET_REPO_NAME": os.environ.get("TARGET_REPO_NAME", "superset-remediation"),
             "AWS_METRICS_BUCKET": os.environ.get("AWS_METRICS_BUCKET", ""),
             "MAX_ACTIVE_REMEDIATIONS": int(os.environ.get("MAX_ACTIVE_REMEDIATIONS", "2")),
-            "NORMALIZATION_TIMEOUT_SECONDS": int(os.environ.get("NORMALIZATION_TIMEOUT_SECONDS", "180")),
             "DEVIN_BYPASS_APPROVAL": os.environ.get("DEVIN_BYPASS_APPROVAL", "false"),
         }
         secret_string = json.dumps(payload)

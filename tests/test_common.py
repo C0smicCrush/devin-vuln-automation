@@ -5,13 +5,14 @@ import unittest
 from scripts.common import (
     build_discovery_prompt,
     build_remediation_prompt_from_work_item,
+    build_verification_prompt,
     canonical_issue_body_from_work_item,
     derive_family_key,
     discovery_output_schema,
     load_test_tier_matrix,
     seed_work_item_from_raw,
     session_output_schema,
-    should_run_preflight,
+    verification_output_schema,
 )
 
 
@@ -59,6 +60,11 @@ class CommonPromptTests(unittest.TestCase):
                 "likely_touched_files": ["package.json"],
                 "requires_new_tests": True,
             },
+            "reviewer_questions": ["Do you want the fix limited to the package bump?"],
+            "reviewer_decision_options": ["Option A: package bump only", "Option B: package bump plus targeted regression test"],
+            "reviewer_recommended_option": "Option B: package bump plus targeted regression test",
+            "reviewer_recommended_option_reason": "It gives a better long-term guardrail with limited extra scope.",
+            "comment_body": "Please proceed with Option B.",
         }
         prompt = build_remediation_prompt_from_work_item(
             "C0smicCrush",
@@ -70,44 +76,16 @@ class CommonPromptTests(unittest.TestCase):
         self.assertIn("npm run test -- --runInBand", prompt)
         self.assertIn("Frontend runtime behavior", prompt)
         self.assertIn("end-to-end remediation operator", prompt)
-        self.assertIn("Investigate whether the issue is actionable", prompt)
+        self.assertIn("First decide whether this input is actionable", prompt)
         self.assertIn("scanner_before", prompt)
         self.assertIn("scanner_after", prompt)
         self.assertIn("one bounded PR per advisory or CVE", prompt)
+        self.assertIn("Option B: package bump plus targeted regression test", prompt)
+        self.assertIn("Please proceed with Option B.", prompt)
 
     def test_family_key_prefers_finding_label(self) -> None:
         family = derive_family_key("Anything", ["finding:dompurify-001", "security-remediation"])
         self.assertEqual(family, "finding-dompurify-001")
-
-    def test_security_github_issue_skips_preflight(self) -> None:
-        raw = {
-            "event_type": "github_issue",
-            "source": {"type": "github_issue", "id": "1", "action": "opened", "url": "https://example.test/1"},
-            "title": "Resolve npm audit DOMPurify vulnerability",
-            "body": "Security remediation for GHSA advisory.",
-            "labels": ["security-remediation", "devin-remediate"],
-        }
-        self.assertFalse(should_run_preflight(raw))
-
-    def test_linear_ticket_uses_preflight(self) -> None:
-        raw = {
-            "event_type": "linear_ticket",
-            "source": {"type": "linear_ticket", "id": "LIN-1", "action": "created", "url": "https://linear.test/LIN-1"},
-            "title": "Investigate frontend package risk",
-            "body": "May require remediation.",
-            "labels": [],
-        }
-        self.assertTrue(should_run_preflight(raw))
-
-    def test_discovery_event_uses_preflight(self) -> None:
-        raw = {
-            "event_type": "scheduled_discovery",
-            "source": {"type": "manual_endpoint", "id": "disc-1", "action": "submitted", "url": "https://example.test/discovery"},
-            "title": "Daily repo discovery run",
-            "body": "Inspect the repo for actionable security findings.",
-            "labels": [],
-        }
-        self.assertTrue(should_run_preflight(raw))
 
     def test_session_schema_includes_validation_receipts(self) -> None:
         schema = session_output_schema()
@@ -115,6 +93,92 @@ class CommonPromptTests(unittest.TestCase):
         for key in ("scanner_before", "scanner_after", "tests", "pr_url", "residual_risk"):
             self.assertIn(key, props)
         self.assertEqual(schema["properties"]["tests"]["type"], "array")
+        self.assertIn("questions_for_human", props)
+        self.assertIn("problem_statement", props)
+        self.assertIn("automation_decision", props)
+        self.assertIn("test_plan", props)
+        self.assertEqual(set(props["result"]["enum"]), {"ignored_non_actionable", "manual_review", "needs_human_input", "completed", "pr_opened"})
+
+    def test_remediation_prompt_describes_single_session_gating(self) -> None:
+        issue = {
+            "number": 73,
+            "title": "Tracked issue",
+            "body": "Body",
+        }
+        work_item = {
+            "problem_statement": "Follow-up request",
+            "scope_tier": "tier1_auto_targeted_runtime",
+            "automation_decision": "auto",
+            "confidence": "medium",
+            "family_key": "tracked-issue",
+            "source": {"type": "github_pr_comment", "id": "9001", "action": "created", "url": "https://example.test/comment/9001"},
+            "body": "Please keep the scope narrow.",
+            "labels": ["devin-remediate"],
+            "test_plan": {
+                "commands": ["npm run test -- --runInBand"],
+                "manual_checks": [],
+                "impacted_surface": ["Frontend runtime behavior"],
+                "likely_touched_files": ["package.json"],
+                "requires_new_tests": True,
+            },
+        }
+        prompt = build_remediation_prompt_from_work_item(
+            "C0smicCrush",
+            "superset-remediation",
+            issue,
+            work_item,
+            "https://github.com/C0smicCrush/superset-remediation",
+        )
+        self.assertIn("single end-to-end remediation operator", prompt)
+        self.assertIn("ignored_non_actionable", prompt)
+        self.assertIn("needs_human_input", prompt)
+        self.assertIn("Testing tier matrix", prompt)
+        self.assertIn("normal non-draft pull request", prompt)
+        self.assertIn("do not open a draft PR", prompt)
+        self.assertIn("reproduce the reported behavior first", prompt)
+        self.assertIn("re-run the same reproduction after the fix", prompt)
+
+    def test_verification_prompt_is_strict_and_independent(self) -> None:
+        issue = {
+            "number": 73,
+            "title": "Soft delete SIP",
+            "body": "Please validate that the PR really fixes the issue.",
+        }
+        pr = {
+            "number": 74,
+            "title": "feat(models): add SoftDeleteMixin skeleton",
+            "html_url": "https://github.com/C0smicCrush/superset-remediation/pull/74",
+            "body": "Draft PR body",
+        }
+        remediation_output = {
+            "summary": "Opened a PR and claimed the issue is fixed.",
+            "scanner_before": {"command": "npm audit --json", "ran": True},
+        }
+        prompt = build_verification_prompt(
+            "C0smicCrush",
+            "superset-remediation",
+            issue,
+            pr,
+            remediation_output,
+            "https://github.com/C0smicCrush/superset-remediation",
+        )
+        self.assertIn("strict post-PR verification reviewer", prompt)
+        self.assertIn("Do not trust the PR description", prompt)
+        self.assertIn("Think like a senior engineer", prompt)
+        self.assertIn("bring up the relevant product surface", prompt)
+        self.assertIn("verdict", prompt)
+        self.assertIn("questions_for_human", prompt)
+        self.assertIn("decision_options", prompt)
+        self.assertIn("recommended_option", prompt)
+
+    def test_verification_schema_captures_verdict_and_checks(self) -> None:
+        schema = verification_output_schema()
+        props = schema["properties"]
+        for key in ("verdict", "summary", "issue_fixed", "tests", "evidence_summary", "pr_url", "questions_for_human", "decision_options", "recommended_option", "recommended_option_reason"):
+            self.assertIn(key, props)
+        self.assertEqual(props["tests"]["type"], "array")
+        self.assertIn("verdict", schema["required"])
+        self.assertIn("issue_fixed", schema["required"])
 
     def test_discovery_prompt_requires_rejected_findings(self) -> None:
         prompt = build_discovery_prompt(

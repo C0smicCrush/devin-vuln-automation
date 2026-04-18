@@ -5,15 +5,16 @@ import os
 import re
 import sys
 import time
+from functools import lru_cache
 from pathlib import Path
+from string import Template
 from typing import Any
 from urllib import error, parse, request
 
+import yaml
+
 
 ROOT = Path(__file__).resolve().parent.parent
-STATE_DIR = ROOT / "state"
-METRICS_DIR = ROOT / "metrics"
-FIXTURES_DIR = ROOT / "fixtures"
 CONFIG_DIR = ROOT / "config"
 
 
@@ -49,14 +50,6 @@ def slugify(value: str) -> str:
 
 def compact_json(payload: Any) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
-
-
-def write_github_output(key: str, value: str) -> None:
-    output_path = os.getenv("GITHUB_OUTPUT")
-    if not output_path:
-        return
-    with open(output_path, "a", encoding="utf-8") as handle:
-        handle.write(f"{key}={value}\n")
 
 
 def http_json(
@@ -135,6 +128,23 @@ def load_test_tier_matrix() -> dict[str, Any]:
     return json_load(CONFIG_DIR / "test_tiers.json", default={"tiers": {}})
 
 
+@lru_cache(maxsize=1)
+def load_prompt_templates() -> dict[str, str]:
+    path = CONFIG_DIR / "prompts.yaml"
+    payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    templates = payload.get("prompts", payload)
+    if not isinstance(templates, dict):
+        raise SystemExit(f"Invalid prompt registry in {path}")
+    return {str(key): str(value) for key, value in templates.items()}
+
+
+def render_prompt(name: str, **context: Any) -> str:
+    templates = load_prompt_templates()
+    if name not in templates:
+        raise SystemExit(f"Missing prompt template: {name}")
+    return Template(templates[name]).safe_substitute(**context)
+
+
 def is_security_related(title: str, body: str = "", labels: list[str] | None = None) -> bool:
     text = " ".join([title or "", body or "", " ".join(labels or [])]).lower()
     keywords = [
@@ -170,19 +180,6 @@ def _first_nonempty_line(text: str) -> str:
         if stripped:
             return stripped
     return ""
-
-
-def should_run_preflight(raw_work_item: dict[str, Any]) -> bool:
-    source = raw_work_item.get("source", {})
-    event_type = str(raw_work_item.get("event_type", "")).lower()
-    if source.get("type") == "linear_ticket":
-        return True
-    return event_type in {
-        "scheduled_discovery",
-        "devin_discovery",
-        "discovery",
-        "repo_review",
-    }
 
 
 def seed_work_item_from_raw(raw_work_item: dict[str, Any], test_matrix: dict[str, Any]) -> dict[str, Any]:
@@ -246,47 +243,6 @@ def seed_work_item_from_raw(raw_work_item: dict[str, Any], test_matrix: dict[str
     return work_item
 
 
-def build_issue_body(finding: dict[str, Any]) -> str:
-    package_name = finding["package"]
-    ecosystem = finding["ecosystem"]
-    manifest = finding["manifest"]
-    current_version = finding["current_version"]
-    fixed_version = finding["fixed_version"]
-    severity = finding["severity"]
-    finding_id = finding["id"]
-    description = finding["description"]
-
-    return f"""## Summary
-Resolve the `{package_name}` vulnerability identified by an upstream scanner signal consumed by the automation pipeline.
-
-## Finding
-- Finding ID: `{finding_id}`
-- Ecosystem: `{ecosystem}`
-- Severity: `{severity}`
-- Current version: `{current_version}`
-- Safe target version: `{fixed_version}`
-- Affected manifest: `{manifest}`
-
-## Context
-{description}
-
-## Source
-- This issue is a tracked work item derived from scanner output.
-- The automation repo owns orchestration; Devin owns the code change and PR.
-
-## Acceptance Criteria
-- Update `{package_name}` to a safe version with the smallest reasonable change.
-- Run the relevant validation command for the touched dependency surface.
-- Open a PR against `main` in this private Superset repo.
-- Summarize risk, validation steps, and any blockers in the PR body.
-
-## Devin Instructions
-- Branch name: `devin/remediate/{slugify(package_name)}-{finding_id}`
-- Prefer a minimal dependency bump over refactors.
-- If the upgrade is blocked, explain the blocker and stop instead of forcing a breaking change.
-"""
-
-
 def canonical_issue_body_from_work_item(work_item: dict[str, Any]) -> str:
     test_plan = work_item.get("test_plan", {})
     touched_files = test_plan.get("likely_touched_files") or []
@@ -339,38 +295,6 @@ def canonical_issue_body_from_work_item(work_item: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def build_devin_prompt(
-    owner: str,
-    repo: str,
-    issue: dict[str, Any],
-    repo_clone_url: str,
-) -> str:
-    issue_number = issue["number"]
-    title = issue["title"]
-    body = issue.get("body") or ""
-    return f"""You are handling a GitHub work item derived from a vulnerability finding in the repository `{owner}/{repo}`.
-
-Repository to work in: {repo_clone_url}
-Issue number: #{issue_number}
-Issue title: {title}
-
-Issue body:
-{body}
-
-Task requirements:
-1. Inspect the vulnerable dependency or package context described in the issue.
-2. Make the smallest safe dependency upgrade that addresses the finding.
-3. Run the narrowest relevant validation command for the impacted area.
-4. Open a pull request against the default branch of `{owner}/{repo}`.
-5. Include a concise summary of the remediation, validation performed, and residual risk.
-
-Output requirements:
-- If you complete the work, ensure the PR is linked to the issue.
-- If blocked, explain the blocker clearly and stop.
-- Do not broaden scope beyond this finding.
-"""
-
-
 def build_remediation_prompt_from_work_item(
     owner: str,
     repo: str,
@@ -378,6 +302,7 @@ def build_remediation_prompt_from_work_item(
     work_item: dict[str, Any],
     repo_clone_url: str,
 ) -> str:
+    test_matrix = load_test_tier_matrix()
     test_plan = work_item.get("test_plan", {})
     commands = test_plan.get("commands") or []
     manual_checks = test_plan.get("manual_checks") or []
@@ -391,103 +316,42 @@ def build_remediation_prompt_from_work_item(
     labels_text = "\n".join(f"- `{item}`" for item in (work_item.get("labels") or [])) or "- None."
     raw_body = work_item.get("body") or "- No raw event body provided."
     issue_body = issue.get("body") or "- No canonical issue body available."
-
-    return f"""You are the end-to-end remediation operator for a scoped engineering work item in `{owner}/{repo}`.
-
-Repository to work in: {repo_clone_url}
-Issue number: #{issue["number"]}
-Issue title: {issue["title"]}
-
-Source event:
-- Type: `{source.get('type', 'unknown')}`
-- Action: `{source.get('action', 'unknown')}`
-- Source id: `{source.get('id', 'unknown')}`
-- Source url: {source.get('url', 'n/a')}
-
-Source labels:
-{labels_text}
-
-Raw event body:
-{raw_body}
-
-Canonical issue body:
-{issue_body}
-
-Normalized problem statement:
-{work_item["problem_statement"]}
-
-Scope tier:
-- Tier: `{work_item["scope_tier"]}`
-- Automation decision: `{work_item["automation_decision"]}`
-- Confidence: `{work_item["confidence"]}`
-
-Impacted surface:
-{surface_text}
-
-Likely touched files:
-{files_text}
-
-Required validation commands:
-{commands_text}
-
-Manual checks to mention if you need approval:
-{manual_text}
-
-Requirements:
-1. Investigate whether the issue is actionable in this repository before making changes.
-2. Treat the provided scope and test plan as preflight guidance, but refine them if repository evidence supports a safer narrow adjustment.
-3. Stay within the smallest safe surface area unless you discover a blocker that requires explicit expansion.
-4. Make the smallest safe fix that resolves the issue.
-5. For dependency or scanner-driven work, prefer one bounded PR per advisory or CVE. If the issue aggregates multiple unrelated advisories, fix only the tightest subset in this PR and explain the remaining ones in the PR body so they can be tracked separately.
-6. If the issue is not actionable, if the scope tier implies manual approval, or if the change becomes riskier than expected, stop and explain why.
-7. Open a pull request against the default branch of `{owner}/{repo}` if the work can be completed safely.
-
-Validation contract (must be produced):
-A. Before making any code change, capture a "scanner_before" receipt by running the most relevant scanner for this work item inside your sandbox. Examples by ecosystem:
-   - npm: `npm audit --json` (or `npm audit`) for the affected package.
-   - python: `pip-audit -r <requirements-file> --no-deps` or `pip-audit --strict`.
-   - generic/security: the narrowest credible reproduction or inspection command.
-   Record the exact command, exit code, and the advisory IDs it reports.
-B. After making the fix, re-run the exact same scanner and capture a "scanner_after" receipt. The fix is only considered validated if the targeted advisory is no longer reported.
-C. Run the scoped tests listed above (or the narrowest credible substitute if those tests are not appropriate for this repository state) and record exact commands, exit codes, and a short pass/fail summary.
-D. If any required validation command cannot run in the sandbox (missing toolchain, network-locked, etc.), state exactly which command failed and why, and do not pretend the fix is validated.
-E. The PR description must include both receipts (before/after scanner output plus test outcomes) so a reviewer can verify the fix without re-running anything.
-
-Output expectations:
-- You own the engineering loop for this work item: investigation, fix selection, validation, and PR/reporting.
-- Populate the structured output fields `scanner_before`, `scanner_after`, `tests`, `residual_risk`, and `pr_url` honestly. Empty or fabricated receipts are a failure mode.
-- If you stop, explain the blocker or manual-review reason clearly in `blocked_reason`.
-- Do not broaden scope into unrelated refactors.
-"""
-
-
-def build_normalization_prompt(work_item: dict[str, Any], test_matrix: dict[str, Any], repo_clone_url: str) -> str:
+    follow_up_comment_text = work_item.get("comment_body") or "- No follow-up comment context."
+    reviewer_questions = "\n".join(f"- {item}" for item in (work_item.get("reviewer_questions") or [])) or "- None."
+    reviewer_options = "\n".join(f"- {item}" for item in (work_item.get("reviewer_decision_options") or [])) or "- None."
+    reviewer_recommendation = work_item.get("reviewer_recommended_option") or "- None."
+    reviewer_recommendation_reason = work_item.get("reviewer_recommended_option_reason") or "- None."
     matrix_text = json.dumps(test_matrix, indent=2, sort_keys=True)
-    return f"""You are performing preflight scoping for an event-driven Devin remediation pipeline.
 
-Repository under consideration: {repo_clone_url}
-
-Raw work item:
-{json.dumps(work_item, indent=2, sort_keys=True)}
-
-Testing tier matrix:
-{matrix_text}
-
-Your job:
-1. Convert the raw event into an initial problem statement for a downstream remediation session.
-2. Determine whether the work item is security or vulnerability related.
-3. Assign the best fitting initial scope tier from the provided testing matrix.
-4. Decide whether the remediation is a good candidate for autonomous execution or should default to manual approval.
-5. Produce an initial test plan with the narrowest credible validation commands.
-6. Identify likely touched files and impacted surfaces.
-7. Produce a canonical GitHub issue title/body if one should be created or updated.
-
-Important constraints:
-- Prefer conservative scoping over aggressive automation.
-- If confidence is low, choose a more cautious tier and require manual approval.
-- Keep the work item tightly bounded; do not invent broad refactors.
-- You are producing preflight guidance, not the final engineering decision. The downstream Devin remediation session will re-evaluate repository reality before acting.
-"""
+    return render_prompt(
+        "remediation",
+        owner=owner,
+        repo=repo,
+        repo_clone_url=repo_clone_url,
+        issue_number=issue["number"],
+        issue_title=issue["title"],
+        source_type=source.get("type", "unknown"),
+        source_action=source.get("action", "unknown"),
+        source_id=source.get("id", "unknown"),
+        source_url=source.get("url", "n/a"),
+        labels_text=labels_text,
+        raw_body=raw_body,
+        issue_body=issue_body,
+        problem_statement=work_item["problem_statement"],
+        scope_tier=work_item["scope_tier"],
+        automation_decision=work_item["automation_decision"],
+        confidence=work_item["confidence"],
+        surface_text=surface_text,
+        files_text=files_text,
+        commands_text=commands_text,
+        manual_text=manual_text,
+        follow_up_comment_text=follow_up_comment_text,
+        reviewer_questions=reviewer_questions,
+        reviewer_options=reviewer_options,
+        reviewer_recommendation=reviewer_recommendation,
+        reviewer_recommendation_reason=reviewer_recommendation_reason,
+        matrix_text=matrix_text,
+    )
 
 
 def build_discovery_prompt(
@@ -496,39 +360,40 @@ def build_discovery_prompt(
     repo_clone_url: str,
     max_findings: int,
 ) -> str:
-    return f"""You are performing a bounded discovery review for `{owner}/{repo}`.
+    return render_prompt(
+        "discovery",
+        owner=owner,
+        repo=repo,
+        repo_clone_url=repo_clone_url,
+        max_findings=max_findings,
+    )
 
-Repository to inspect: {repo_clone_url}
 
-Goal:
-- Find at most {max_findings} actionable security or vulnerability remediation candidates.
-
-Requirements:
-1. Only report findings that are strongly supported by repository evidence or deterministic dependency/security evidence (scanner output, pinned-vulnerable versions, advisory IDs, etc.).
-2. Prefer concrete dependency vulnerabilities, unsafe configuration, or clearly actionable security flaws over speculative concerns.
-3. Validate that each accepted finding is real enough to justify creating a tracked GitHub issue in this repository.
-4. Prefer one advisory or CVE per finding so downstream remediation PRs stay bounded. Only aggregate multiple advisories into one finding if they share a single package bump with no other surface.
-5. If you are not confident a finding is real and actionable, do not include it in `findings`. Instead, record it in `rejected_findings` with a short, concrete reason.
-6. Keep the accepted list short and high signal. Returning zero accepted findings is acceptable.
-
-For each accepted finding you include:
-- Provide a concise title and problem statement.
-- State the evidence and why it is actionable in this repository.
-- Suggest the smallest safe remediation scope.
-- Choose an initial scope tier and automation decision.
-- Provide a narrow validation plan.
-- Include labels that would make sense on a tracked GitHub issue.
-
-For each rejected finding you considered but discarded:
-- Record the advisory ID or short title.
-- Explain in one or two sentences why it is not actionable here (false positive, unused code path, upstream-only advisory, too-large bump, already fixed, etc.).
-- This audit trail is part of the deliverable; an empty `rejected_findings` list is acceptable only if nothing was considered and rejected.
-
-Important constraints:
-- Do not propose broad refactors.
-- Do not include hypothetical or weakly supported issues in `findings`.
-- Prefer fewer, higher-confidence findings over many marginal ones.
-"""
+def build_verification_prompt(
+    owner: str,
+    repo: str,
+    issue: dict[str, Any],
+    pr: dict[str, Any],
+    remediation_output: dict[str, Any],
+    repo_clone_url: str,
+) -> str:
+    remediation_text = json.dumps(remediation_output or {}, indent=2, sort_keys=True)
+    issue_body = issue.get("body") or "- No issue body available."
+    pr_body = pr.get("body") or "- No PR body available."
+    return render_prompt(
+        "verification",
+        owner=owner,
+        repo=repo,
+        repo_clone_url=repo_clone_url,
+        issue_number=issue["number"],
+        issue_title=issue["title"],
+        pr_number=pr["number"],
+        pr_title=pr["title"],
+        pr_url=pr["html_url"],
+        issue_body=issue_body,
+        pr_body=pr_body,
+        remediation_text=remediation_text,
+    )
 
 
 def session_output_schema() -> dict[str, Any]:
@@ -561,13 +426,64 @@ def session_output_schema() -> dict[str, Any]:
         },
         "required": ["command", "ran"],
     }
+    test_plan = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "commands": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "manual_checks": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "impacted_surface": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "likely_touched_files": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "requires_new_tests": {"type": "boolean"},
+        },
+        "required": [
+            "commands",
+            "manual_checks",
+            "impacted_surface",
+            "likely_touched_files",
+            "requires_new_tests",
+        ],
+    }
     return {
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "result": {"type": "string"},
+            "result": {
+                "type": "string",
+                "enum": [
+                    "ignored_non_actionable",
+                    "manual_review",
+                    "needs_human_input",
+                    "completed",
+                    "pr_opened",
+                ],
+            },
             "summary": {"type": "string"},
-            "validation": {"type": "string"},
+            "problem_statement": {"type": "string"},
+            "family_key": {"type": "string"},
+            "is_security_related": {"type": "boolean"},
+            "scope_tier": {"type": "string"},
+            "automation_decision": {"type": "string"},
+            "confidence": {"type": "string"},
+            "canonical_issue_title": {"type": "string"},
+            "canonical_issue_body": {"type": "string"},
+            "issue_labels": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "test_plan": test_plan,
             "blocked_reason": {"type": "string"},
             "pr_url": {"type": "string"},
             "scanner_before": scanner_receipt,
@@ -577,6 +493,16 @@ def session_output_schema() -> dict[str, Any]:
                 "items": test_receipt,
             },
             "residual_risk": {"type": "string"},
+            "questions_for_human": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "decision_options": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "recommended_option": {"type": "string"},
+            "recommended_option_reason": {"type": "string"},
             "fixed_advisories": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -590,68 +516,55 @@ def session_output_schema() -> dict[str, Any]:
     }
 
 
-def normalization_output_schema() -> dict[str, Any]:
+def verification_output_schema() -> dict[str, Any]:
+    test_receipt = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "command": {"type": "string"},
+            "exit_code": {"type": "integer"},
+            "passed": {"type": "boolean"},
+            "summary": {"type": "string"},
+            "ran": {"type": "boolean"},
+            "not_run_reason": {"type": "string"},
+        },
+        "required": ["command", "ran"],
+    }
     return {
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "problem_statement": {"type": "string"},
-            "family_key": {"type": "string"},
-            "is_security_related": {"type": "boolean"},
-            "scope_tier": {"type": "string"},
-            "automation_decision": {"type": "string"},
-            "confidence": {"type": "string"},
+            "verdict": {"type": "string"},
             "summary": {"type": "string"},
-            "canonical_issue_title": {"type": "string"},
-            "canonical_issue_body": {"type": "string"},
-            "issue_labels": {
+            "confidence": {"type": "string"},
+            "issue_fixed": {"type": "boolean"},
+            "evidence_summary": {"type": "string"},
+            "blocked_reason": {"type": "string"},
+            "tests": {
+                "type": "array",
+                "items": test_receipt,
+            },
+            "questions_for_human": {
                 "type": "array",
                 "items": {"type": "string"},
             },
-            "test_plan": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "commands": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                    },
-                    "manual_checks": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                    },
-                    "impacted_surface": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                    },
-                    "likely_touched_files": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                    },
-                    "requires_new_tests": {"type": "boolean"},
-                },
-                "required": [
-                    "commands",
-                    "manual_checks",
-                    "impacted_surface",
-                    "likely_touched_files",
-                    "requires_new_tests",
-                ],
+            "decision_options": {
+                "type": "array",
+                "items": {"type": "string"},
             },
+            "recommended_option": {"type": "string"},
+            "recommended_option_reason": {"type": "string"},
+            "regressions_found": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "follow_up_actions": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "pr_url": {"type": "string"},
         },
-        "required": [
-            "problem_statement",
-            "family_key",
-            "is_security_related",
-            "scope_tier",
-            "automation_decision",
-            "confidence",
-            "summary",
-            "canonical_issue_title",
-            "canonical_issue_body",
-            "issue_labels",
-            "test_plan",
-        ],
+        "required": ["verdict", "summary", "issue_fixed"],
     }
 
 

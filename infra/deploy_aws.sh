@@ -6,7 +6,7 @@ APP_NAME="${APP_NAME:-devin-vuln-automation}"
 REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 QUEUE_DELAY_SECONDS="${QUEUE_DELAY_SECONDS:-30}"
-DISCOVERY_SCHEDULE="${DISCOVERY_SCHEDULE:-rate(2 hours)}"
+DISCOVERY_SCHEDULE="${DISCOVERY_SCHEDULE:-rate(1 day)}"
 QUEUE_NAME="${APP_NAME}-buffer.fifo"
 DLQ_NAME="${APP_NAME}-dlq.fifo"
 SECRET_NAME="${APP_NAME}-runtime"
@@ -319,13 +319,27 @@ fi
 
 FUNCTION_URL="$(aws lambda get-function-url-config --region "${REGION}" --function-name "${APP_NAME}-intake" --query FunctionUrl --output text)"
 GITHUB_WEBHOOK_SECRET="$(aws secretsmanager get-secret-value --region "${REGION}" --secret-id "${SECRET_NAME}" --query SecretString --output text | jq -r '.GITHUB_WEBHOOK_SECRET')"
+HOOK_ID="$(gh api "repos/C0smicCrush/superset-remediation/hooks" --jq ".[] | select(.config.url == \"${FUNCTION_URL}github\") | .id" 2>/dev/null | head -n 1)"
 
-if ! gh api "repos/C0smicCrush/superset-remediation/hooks" --jq '.[].config.url' 2>/dev/null | grep -Fx "${FUNCTION_URL}github" >/dev/null; then
+if [ -n "${HOOK_ID}" ]; then
+  gh api "repos/C0smicCrush/superset-remediation/hooks/${HOOK_ID}" \
+    --method PATCH \
+    -f name='web' \
+    -F active=true \
+    -f events[]='issues' \
+    -f events[]='issue_comment' \
+    -f events[]='pull_request_review_comment' \
+    -f config[url]="${FUNCTION_URL}github" \
+    -f config[content_type]='json' \
+    -f config[secret]="${GITHUB_WEBHOOK_SECRET}" >/dev/null
+else
   gh api "repos/C0smicCrush/superset-remediation/hooks" \
     --method POST \
     -f name='web' \
     -F active=true \
     -f events[]='issues' \
+    -f events[]='issue_comment' \
+    -f events[]='pull_request_review_comment' \
     -f config[url]="${FUNCTION_URL}github" \
     -f config[content_type]='json' \
     -f config[secret]="${GITHUB_WEBHOOK_SECRET}" >/dev/null
