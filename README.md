@@ -6,12 +6,13 @@ The short version: `the control plane governs intake, ordering, status, and guar
 
 ## Reviewer Quickstart
 
-There are three ways to exercise this project. Pick the one that matches what you have.
+There are four ways to exercise this project, ordered from least to most setup. Pick the one that matches what you have. `GH_TOKEN` alone gets you the first two; Devin credentials unlock the full remediation loop; deployed AWS unlocks the webhook path.
 
 | Path | What it shows | Requires |
 | --- | --- | --- |
-| **A — Dashboard-only** | Boot the stack and view the live dashboard against `superset-remediation` (tracked issues, PR rollups, conversion, daily activity). No Devin calls. | `GH_TOKEN` only |
-| **B — Local remediation loop** | `curl /manual` drives a full remediation + verification cycle against `superset-remediation`, including a real Devin PR. | `GH_TOKEN` + `DEVIN_API_KEY` + `DEVIN_ORG_ID` |
+| **A — Dashboard-only** | Boot the stack and view the live dashboard against `superset-remediation` (tracked issues, PR rollups, conversion, daily activity) pulled from live GitHub + Devin APIs. | `GH_TOKEN` only |
+| **B-lite — `/manual` creates a real GitHub issue** | `curl /manual` → intake → worker → `ensure_tracking_issue` opens a real labeled issue on `superset-remediation`. Devin launch step errors cleanly (expected without keys). | `GH_TOKEN` only |
+| **B-full — Local remediation loop** | Same `/manual`, but with Devin keys set, the worker launches a real Devin remediation session, the poller fires a verification session once the PR appears, and the dashboard tracks both. | `GH_TOKEN` + `DEVIN_API_KEY` + `DEVIN_ORG_ID` |
 | **C — Webhook-driven (hosted)** | Label a GitHub issue `devin-remediate` → webhook → intake → Devin. Shown in the Loom; requires the AWS stack deployed and the webhook pointed at your Function URL. | Deployed stack + admin on target repo |
 
 ### Path A — Dashboard-only
@@ -23,20 +24,25 @@ open http://localhost:8001     # dashboard
 open http://localhost:8000/health
 ```
 
-If a `metrics/latest.json` snapshot is present in the repo, the dashboard also renders prior session history, verdicts, and ACU breakdowns immediately on first boot.
+The dashboard reads live state from GitHub the moment it boots: tracked-issue counts, PR merge ratio, daily activity, Devin session history. No prior metrics snapshot needed.
 
-### Path B — Local remediation loop
+### Path B-lite — `/manual` creates a real GitHub issue (PAT only)
 
-Same as above, plus set `DEVIN_API_KEY` and `DEVIN_ORG_ID` in `.env` (generate from `app.devin.ai` → org settings), then:
+With just `GH_TOKEN` set:
 
 ```bash
+make docker-up
 curl -sS -X POST "http://localhost:8000/manual" \
   -H "Content-Type: application/json" \
   --data @fixtures/manual.sample.json
-make docker-logs                # watch it move through intake → worker → Devin
+make docker-logs                # watch intake → worker → ensure_tracking_issue
 ```
 
-The dashboard at `http://localhost:8001` will update as the remediation session progresses and as verification kicks in once the PR appears.
+A new issue will appear on `C0smicCrush/superset-remediation` with labels `devin-remediate`, `security-remediation`, `manual-source`, `aws-event-driven`. The worker will then error on the Devin API call (expected — no keys). This is the simplest way to see intake, queueing, worker normalization, and GitHub integration without generating a Devin key.
+
+### Path B-full — Full remediation loop
+
+Add `DEVIN_API_KEY` and `DEVIN_ORG_ID` to `.env` (generate from `app.devin.ai` → org settings), then re-run Path B-lite. The worker now launches a real Devin remediation session, the poller spawns a verification session once a PR is opened, and the dashboard updates live as both progress.
 
 ### Path C — Webhook-driven
 
