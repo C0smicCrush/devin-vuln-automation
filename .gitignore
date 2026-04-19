@@ -12,6 +12,7 @@ state/**
 metrics/**
 !metrics/
 !metrics/.gitkeep
+!metrics/latest.json
 build/
 dist/
 *.zip

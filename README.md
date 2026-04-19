@@ -2,15 +2,43 @@
 
 Thin control plane that turns engineering signals into governed Devin remediation runs against a target GitHub repository. Default target: `C0smicCrush/superset-remediation`.
 
-## Quickstart (Docker)
+The short version: `the control plane governs intake, ordering, status, and guardrails; Devin does the engineering work`.
 
-1. Copy `.env.example` to `.env` and set `GH_TOKEN`, `DEVIN_API_KEY`, `DEVIN_ORG_ID`.
-2. `make docker-up`
-3. Check: intake `http://localhost:8000/health` · dashboard `http://localhost:8001`
+## Reviewer Quickstart
 
-## Truly Test It
+There are three ways to exercise this project. Pick the one that matches what you have.
 
-Create a GitHub issue on the target repo **and add the `devin-remediate` label**. That is the real end-to-end path — intake accepts it, the worker launches Devin, and the dashboard reflects progress.
+| Path | What it shows | Requires |
+| --- | --- | --- |
+| **A — Dashboard-only** | Boot the stack and view the live dashboard against `superset-remediation` (tracked issues, PR rollups, conversion, daily activity). No Devin calls. | `GH_TOKEN` only |
+| **B — Local remediation loop** | `curl /manual` drives a full remediation + verification cycle against `superset-remediation`, including a real Devin PR. | `GH_TOKEN` + `DEVIN_API_KEY` + `DEVIN_ORG_ID` |
+| **C — Webhook-driven (hosted)** | Label a GitHub issue `devin-remediate` → webhook → intake → Devin. Shown in the Loom; requires the AWS stack deployed and the webhook pointed at your Function URL. | Deployed stack + admin on target repo |
+
+### Path A — Dashboard-only
+
+```bash
+cp .env.example .env           # set GH_TOKEN only
+make docker-up                  # builds + starts intake, worker, poller, dashboard
+open http://localhost:8001     # dashboard
+open http://localhost:8000/health
+```
+
+If a `metrics/latest.json` snapshot is present in the repo, the dashboard also renders prior session history, verdicts, and ACU breakdowns immediately on first boot.
+
+### Path B — Local remediation loop
+
+Same as above, plus set `DEVIN_API_KEY` and `DEVIN_ORG_ID` in `.env` (generate from `app.devin.ai` → org settings), then:
+
+```bash
+curl -sS -X POST "http://localhost:8000/manual" \
+  -H "Content-Type: application/json" \
+  --data @fixtures/manual.sample.json
+make docker-logs                # watch it move through intake → worker → Devin
+```
+
+The dashboard at `http://localhost:8001` will update as the remediation session progresses and as verification kicks in once the PR appears.
+
+### Path C — Webhook-driven
 
 ```bash
 gh issue create \
@@ -20,9 +48,11 @@ gh issue create \
   --label devin-remediate
 ```
 
+This path only fires end-to-end when the webhook on the target repo points at a reachable `/github` URL (the deployed AWS Function URL in this project). Running the stack on localhost won't intercept it without a tunnel + webhook admin. The Loom walks through this flow on the deployed stack.
+
 ## Need More Detail?
 
-Everything below the `---` is the extended README. **Paste it into Cursor** and ask — it covers architecture, runtime modes, deployment, dashboard, security, and trade-offs.
+Everything below the `---` is the extended README. **Paste it into Cursor** and ask — it covers architecture, runtime modes, deployment, dashboard, security, and trade-offs. `ARCHITECTURE.md` has the full system design.
 
 ---
 
