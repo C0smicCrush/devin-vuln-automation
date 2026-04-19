@@ -6,10 +6,12 @@ __pycache__/
 !.env.example
 node_modules/
 dashboard/app.js
-metrics/latest.json
-metrics/summary.md
-state/*.json
-!.gitkeep
+state/**
+!state/
+!state/.gitkeep
+metrics/**
+!metrics/
+!metrics/.gitkeep
 build/
 dist/
 *.zip

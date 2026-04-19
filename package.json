@@ -1,0 +1,10 @@
+{
+  "name": "devin-vuln-automation-dashboard",
+  "private": true,
+  "scripts": {
+    "build:dashboard": "tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  }
+}

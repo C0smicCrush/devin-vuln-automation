@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Devin Vuln Automation Dashboard</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <main class="page">
+      <header class="hero">
+        <div>
+          <p class="eyebrow">Docker Local Observability</p>
+          <h1>Devin Vulnerability Automation</h1>
+          <p class="subtitle">
+            Lightweight control-plane dashboard for local intake, worker, poller, and review flow.
+          </p>
+        </div>
+        <div class="hero-actions">
+          <button id="refresh-button" type="button">Refresh</button>
+          <span id="last-updated">Loading...</span>
+        </div>
+      </header>
+
+      <section class="panel panel-links">
+        <div>
+          <h2>Repository</h2>
+          <p id="repo-name">Loading...</p>
+        </div>
+        <div class="link-row">
+          <a id="repo-link" href="#" target="_blank" rel="noreferrer">Repository</a>
+          <a id="issues-link" href="#" target="_blank" rel="noreferrer">Issues</a>
+          <a id="pulls-link" href="#" target="_blank" rel="noreferrer">Pull Requests</a>
+        </div>
+      </section>
+
+      <section class="cards" id="overview-cards"></section>
+
+      <section class="panel">
+        <h2>GitHub Outcome Analytics</h2>
+        <p class="subtitle" id="github-analytics-status">
+          Waiting for repo-derived analytics.
+        </p>
+        <section class="cards" id="repo-analytics-cards"></section>
+        <section class="timeline-panel">
+          <div class="timeline-header">
+            <h3>Daily Activity</h3>
+            <p class="subtitle">Tracked issues and linked PR events by day.</p>
+          </div>
+          <div class="timeline-legend" id="daily-activity-legend"></div>
+          <div class="timeline-chart" id="daily-activity-chart"></div>
+        </section>
+      </section>
+
+      <section class="panel">
+        <h2>Verification Verdicts</h2>
+        <div id="verdict-cards" class="mini-cards"></div>
+        <div class="verdict-visual">
+          <div id="verdict-donut" class="verdict-donut"></div>
+          <div id="verdict-donut-legend" class="verdict-donut-legend"></div>
+        </div>
+        <div class="verdict-filter-header">
+          <h3 id="verdict-filter-title">All Tracked Issues</h3>
+          <button id="verdict-clear-filter" type="button">Show All</button>
+        </div>
+        <div id="verdict-issue-blocks" class="issue-blocks"></div>
+      </section>
+
+      <section class="panel">
+        <h2>Tracked Issue Rollups</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Issue</th>
+                <th>Remediation Loops</th>
+                <th>Verification Sessions</th>
+                <th>Latest Verdict</th>
+                <th>Human Follow-Ups</th>
+              </tr>
+            </thead>
+            <tbody id="issues-body">
+              <tr><td colspan="5">Loading...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+  </html>

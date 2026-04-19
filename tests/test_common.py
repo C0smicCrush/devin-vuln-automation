@@ -135,8 +135,17 @@ class CommonPromptTests(unittest.TestCase):
         self.assertIn("Testing tier matrix", prompt)
         self.assertIn("normal non-draft pull request", prompt)
         self.assertIn("do not open a draft PR", prompt)
+        self.assertIn("Bring up the actual repository and relevant product or runtime surface every time you run", prompt)
+        self.assertIn("bring up the actual app, product surface, or runtime path as part of validation", prompt)
+        self.assertIn("you must reproduce through the repository's real local runtime using Docker Compose", prompt)
+        self.assertIn("Do not ask the human to choose between reproduction paths", prompt)
+        self.assertIn("Jest-only, unit-test-only, or static-analysis-only reproduction is not sufficient", prompt)
+        self.assertIn("include the exact Docker Compose commands", prompt)
         self.assertIn("reproduce the reported behavior first", prompt)
         self.assertIn("re-run the same reproduction after the fix", prompt)
+        self.assertIn("treat that follow-up comment as the latest controlling instruction", prompt)
+        self.assertIn("A human follow-up comment can override a prior `manual_review`", prompt)
+        self.assertIn("Do not re-ask questions that the latest human follow-up comment already answered", prompt)
 
     def test_verification_prompt_is_strict_and_independent(self) -> None:
         issue = {

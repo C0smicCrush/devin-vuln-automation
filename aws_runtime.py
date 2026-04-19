@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import hmac
 import json
 import os
 import re
 import time
+import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -46,13 +49,95 @@ CONTROL_PLANE_COMMENT_PREFIXES = (
 IGNORED_COMMENT_LOGINS = {"devin-ai-integration"}
 
 
+def _runtime_backend() -> str:
+    backend = (os.getenv("RUNTIME_BACKEND") or "").strip().lower()
+    if backend:
+        return backend
+    return "aws" if os.getenv("AWS_APP_SECRET_NAME") else "local"
+
+
+def _local_state_root() -> Path:
+    return Path(os.getenv("LOCAL_STATE_DIR", "state"))
+
+
+def _local_metrics_root() -> Path:
+    return Path(os.getenv("LOCAL_METRICS_DIR", "metrics"))
+
+
+def _ensure_parent(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+
+@contextmanager
+def _locked_file(path: Path):
+    _ensure_parent(path)
+    with path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        handle.seek(0)
+        try:
+            yield handle
+        finally:
+            handle.flush()
+            os.fsync(handle.fileno())
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _local_queue_path(settings: dict[str, Any]) -> Path:
+    return Path(settings["local_state_dir"]) / "queue" / "work_items.json"
+
+
+def _local_queue_lock_path(settings: dict[str, Any]) -> Path:
+    return Path(settings["local_state_dir"]) / "queue" / ".lock"
+
+
+def _local_comment_dedupe_path(settings: dict[str, Any], comment_id: str) -> Path:
+    return Path(settings["local_state_dir"]) / "dedupe" / "comments" / f"{comment_id}.json"
+
+
+def _local_discovery_lock_path(settings: dict[str, Any]) -> Path:
+    return Path(settings["local_state_dir"]) / "locks" / "discovery.lock"
+
+
+def _local_metrics_path(settings: dict[str, Any]) -> Path:
+    return Path(settings["local_metrics_dir"]) / "latest.json"
+
+
 def load_runtime_settings() -> dict[str, Any]:
+    backend = _runtime_backend()
+    if backend == "local":
+        owner = os.getenv("TARGET_REPO_OWNER", "C0smicCrush")
+        repo = os.getenv("TARGET_REPO_NAME", "superset-remediation")
+        return {
+            "backend": backend,
+            "gh_token": env("GH_TOKEN"),
+            "devin_api_key": env("DEVIN_API_KEY"),
+            "devin_org_id": env("DEVIN_ORG_ID"),
+            "github_webhook_secret": os.getenv("GITHUB_WEBHOOK_SECRET", ""),
+            "linear_webhook_secret": os.getenv("LINEAR_WEBHOOK_SECRET", ""),
+            "queue_url": os.getenv("AWS_SQS_QUEUE_URL", "local://work-items"),
+            "metrics_bucket": "",
+            "owner": owner,
+            "repo": repo,
+            "repo_url": f"https://github.com/{owner}/{repo}",
+            "max_active_remediations": int(os.getenv("MAX_ACTIVE_REMEDIATIONS", "2")),
+            "discovery_timeout_seconds": int(os.getenv("DISCOVERY_TIMEOUT_SECONDS", "900")),
+            "discovery_lock_ttl_seconds": int(os.getenv("DISCOVERY_LOCK_TTL_SECONDS", "5400")),
+            "max_discovery_findings": int(os.getenv("MAX_DISCOVERY_FINDINGS", "1")),
+            "remediation_bypass_approval": str(os.getenv("DEVIN_BYPASS_APPROVAL", "false")).lower()
+            in {"1", "true", "yes", "on"},
+            "verification_bypass_approval": str(os.getenv("DEVIN_VERIFICATION_BYPASS_APPROVAL", "false")).lower()
+            in {"1", "true", "yes", "on"},
+            "local_state_dir": str(_local_state_root()),
+            "local_metrics_dir": str(_local_metrics_root()),
+        }
+
     secret_name = env("AWS_APP_SECRET_NAME")
     secret_value = secrets_client.get_secret_value(SecretId=secret_name)["SecretString"]
     payload = json.loads(secret_value)
     owner = os.getenv("TARGET_REPO_OWNER", payload.get("TARGET_REPO_OWNER", "C0smicCrush"))
     repo = os.getenv("TARGET_REPO_NAME", payload.get("TARGET_REPO_NAME", "superset-remediation"))
     return {
+        "backend": backend,
         "gh_token": payload["GH_TOKEN"],
         "devin_api_key": payload["DEVIN_API_KEY"],
         "devin_org_id": payload["DEVIN_ORG_ID"],
@@ -69,6 +154,8 @@ def load_runtime_settings() -> dict[str, Any]:
         "max_discovery_findings": int(payload.get("MAX_DISCOVERY_FINDINGS", os.getenv("MAX_DISCOVERY_FINDINGS", 1))),
         "remediation_bypass_approval": str(payload.get("DEVIN_BYPASS_APPROVAL", "false")).lower() in {"1", "true", "yes", "on"},
         "verification_bypass_approval": str(payload.get("DEVIN_VERIFICATION_BYPASS_APPROVAL", "false")).lower() in {"1", "true", "yes", "on"},
+        "local_state_dir": str(_local_state_root()),
+        "local_metrics_dir": str(_local_metrics_root()),
     }
 
 
@@ -125,6 +212,16 @@ def _comment_dedupe_key(comment_id: str) -> str:
 
 
 def register_comment_event_once(settings: dict[str, Any], comment_id: str, payload: dict[str, Any]) -> bool:
+    if settings.get("backend") == "local":
+        path = _local_comment_dedupe_path(settings, comment_id)
+        _ensure_parent(path)
+        try:
+            with path.open("x", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+            return True
+        except FileExistsError:
+            return False
+
     bucket = settings.get("metrics_bucket")
     if not bucket:
         return True
@@ -543,6 +640,15 @@ def enqueue_work_item(
     settings: dict[str, Any],
     work_item: dict[str, Any],
 ) -> dict[str, Any]:
+    if settings.get("backend") == "local":
+        queue_path = _local_queue_path(settings)
+        message_id = f"local-{utc_now()}-{uuid.uuid4().hex[:12]}"
+        with _locked_file(_local_queue_lock_path(settings)):
+            queue = json_load(queue_path, default=[])
+            queue.append({"message_id": message_id, "queued_at": utc_now(), "body": work_item})
+            json_dump(queue_path, queue)
+        return {"message_id": message_id}
+
     message_body = compact_json(work_item)
     attributes = {
         "source_type": {"DataType": "String", "StringValue": work_item["source"]["type"]},
@@ -562,6 +668,19 @@ def enqueue_work_item(
     return {"message_id": response["MessageId"]}
 
 
+def dequeue_work_item(settings: dict[str, Any]) -> dict[str, Any] | None:
+    if settings.get("backend") != "local":
+        raise SystemExit("dequeue_work_item is only supported for the local runtime backend")
+    queue_path = _local_queue_path(settings)
+    with _locked_file(_local_queue_lock_path(settings)):
+        queue = json_load(queue_path, default=[])
+        if not queue:
+            return None
+        message = queue.pop(0)
+        json_dump(queue_path, queue)
+    return message
+
+
 def list_project_sessions(settings: dict[str, Any], phase: str | None = None) -> list[dict[str, Any]]:
     params = ["first=100", "tags=project%3Adevin-vuln-automation"]
     if phase:
@@ -571,7 +690,12 @@ def list_project_sessions(settings: dict[str, Any], phase: str | None = None) ->
         f"/v3/organizations/{settings['devin_org_id']}/sessions?{'&'.join(params)}",
         api_key=settings["devin_api_key"],
     )
-    return payload.get("items") or payload.get("sessions") or []
+    sessions = payload.get("items") or payload.get("sessions") or []
+    filtered = [session for session in sessions if not session.get("is_archived")]
+    if phase:
+        phase_tag = f"phase:{phase}"
+        filtered = [session for session in filtered if phase_tag in (session.get("tags") or [])]
+    return filtered
 
 
 def has_active_discovery_session(settings: dict[str, Any]) -> bool:
@@ -615,6 +739,25 @@ def _discovery_lock_key() -> str:
 
 
 def acquire_discovery_lock(settings: dict[str, Any], holder: str, ttl_seconds: int) -> bool:
+    if settings.get("backend") == "local":
+        path = _local_discovery_lock_path(settings)
+        _ensure_parent(path)
+        now = utc_now()
+        payload = {
+            "holder": holder,
+            "created_at": now,
+            "expires_at": now + ttl_seconds,
+        }
+        lock_path = path.with_suffix(".guard")
+        with _locked_file(lock_path):
+            if path.exists():
+                current = json_load(path, default={}) or {}
+                if int(current.get("expires_at", 0)) > now:
+                    return False
+                path.unlink(missing_ok=True)
+            path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        return True
+
     bucket = settings.get("metrics_bucket")
     if not bucket:
         return True
@@ -660,6 +803,10 @@ def acquire_discovery_lock(settings: dict[str, Any], holder: str, ttl_seconds: i
 
 
 def release_discovery_lock(settings: dict[str, Any]) -> None:
+    if settings.get("backend") == "local":
+        _local_discovery_lock_path(settings).unlink(missing_ok=True)
+        return
+
     bucket = settings.get("metrics_bucket")
     if not bucket:
         return
@@ -799,6 +946,10 @@ def launch_verification_session(
 
 
 def store_metrics_snapshot(settings: dict[str, Any], payload: dict[str, Any]) -> None:
+    if settings.get("backend") == "local":
+        json_dump(_local_metrics_path(settings), payload)
+        return
+
     bucket = settings.get("metrics_bucket")
     if not bucket:
         return
@@ -811,4 +962,6 @@ def store_metrics_snapshot(settings: dict[str, Any], payload: dict[str, Any]) ->
 
 
 def snapshot_path(name: str) -> Path:
+    if _runtime_backend() == "local":
+        return _local_state_root() / "snapshots" / name
     return Path("/tmp") / name

@@ -61,11 +61,17 @@ prompts:
     3. If the input is not actionable, is out of scope, or is just non-actionable chatter, stop cleanly with result `ignored_non_actionable`.
     4. If the work should not be executed autonomously, stop cleanly with result `manual_review`.
     5. If you are blocked on missing human information, stop cleanly with result `needs_human_input`.
-    6. If the work is actionable and safe, stay within the smallest safe surface area unless repository evidence requires explicit expansion.
-    7. For user-reported bugs or regressions, reproduce the reported behavior first (or explicitly prove you could not reproduce it) before making any code change.
-    8. Make the smallest safe fix that resolves the issue.
-    9. For dependency or scanner-driven work, prefer one bounded PR per advisory or CVE. If the issue aggregates multiple unrelated advisories, fix only the tightest subset in this PR and explain the remaining ones in the PR body so they can be tracked separately.
-    10. Open a normal non-draft pull request against the default branch of `$owner/$repo` if the work can be completed safely.
+    5a. If this run was triggered by a human follow-up comment and that comment explicitly answers prior questions, approves a recommended option, or authorizes a bounded increment, treat that follow-up comment as the latest controlling instruction for this run.
+    5b. A human follow-up comment can override a prior `manual_review` or `needs_human_input` stop for the same issue when it provides the missing approval or decisions. Do not re-ask questions that the latest human follow-up comment already answered.
+    5c. When the latest human follow-up comment authorizes a bounded first increment, proceed with that increment even if the umbrella issue remains broad, as long as the requested increment is itself reasonably scoped and safe.
+    6. Bring up the actual repository and relevant product or runtime surface every time you run when the repo can be exercised locally. Do not stay purely at the static code-reading level.
+    7. For bug reports and regressions, you must reproduce through the repository's real local runtime using Docker Compose before making any code change whenever this repository has a Compose-based local stack. Jest-only, unit-test-only, or static-analysis-only reproduction is not sufficient by itself for a UI or runtime bug if Docker Compose reproduction is available.
+    8. Do not ask the human to choose between reproduction paths for a bug report. If Docker Compose reproduction is available, use it. If Docker Compose reproduction is unavailable or fails, stop cleanly without making code changes and explain exactly what failed.
+    9. If the work is actionable and safe, stay within the smallest safe surface area unless repository evidence requires explicit expansion.
+    10. For user-reported bugs or regressions, reproduce the reported behavior first (or explicitly prove you could not reproduce it) before making any code change.
+    11. Make the smallest safe fix that resolves the issue.
+    12. For dependency or scanner-driven work, prefer one bounded PR per advisory or CVE. If the issue aggregates multiple unrelated advisories, fix only the tightest subset in this PR and explain the remaining ones in the PR body so they can be tracked separately.
+    13. Open a normal non-draft pull request against the default branch of `$owner/$repo` if the work can be completed safely.
 
     Validation contract (must be produced):
     A. Before making any code change, capture a "scanner_before" receipt by running the most relevant scanner for this work item inside your sandbox. Examples by ecosystem:
@@ -76,8 +82,10 @@ prompts:
     B. After making the fix, re-run the exact same scanner and capture a "scanner_after" receipt. The fix is only considered validated if the targeted advisory is no longer reported.
     C. Run the scoped tests listed above (or the narrowest credible substitute if those tests are not appropriate for this repository state) and record exact commands, exit codes, and a short pass/fail summary.
     D. If any required validation command cannot run in the sandbox (missing toolchain, network-locked, etc.), state exactly which command failed and why, and do not pretend the fix is validated.
-    E. The PR description must include both receipts (before/after scanner output plus test outcomes) so a reviewer can verify the fix without re-running anything.
-    F. When the issue is not a scanner-driven vulnerability, reproduce the reported bug or regression before the fix and then re-run the same reproduction after the fix. Record both checks in `tests`. If you cannot reproduce it, say exactly what you tried and why the bug remains unconfirmed.
+    E. If the repository can be exercised locally, bring up the actual app, product surface, or runtime path as part of validation instead of relying only on unit tests or static inspection. For bug reports in this repository, this means the Docker Compose stack unless you explicitly prove that Docker Compose was unavailable. Record what you launched and what you observed in `tests`.
+    F. For UI or runtime bugs, include the exact Docker Compose commands and the exact before/after reproduction steps in `tests`. If Docker Compose bring-up fails, record the failure command and error, do not make a speculative fix, and do not substitute a Jest-only reproduction as if it were equivalent.
+    G. The PR description must include both receipts (before/after scanner output plus test outcomes) so a reviewer can verify the fix without re-running anything.
+    H. When the issue is not a scanner-driven vulnerability, reproduce the reported bug or regression before the fix and then re-run the same reproduction after the fix. Record both checks in `tests`. If you cannot reproduce it, say exactly what you tried and why the bug remains unconfirmed.
 
     Output expectations:
     - You own the engineering loop for this work item: triage, scope selection, fix selection, validation, and PR/reporting.
@@ -93,6 +101,7 @@ prompts:
     - If you stop, explain the blocker or stop reason clearly in `blocked_reason`.
     - If you need human input, ask only for the minimum missing information. Put those requests in `questions_for_human` as short, direct, human-friendly questions or bullet points.
     - If there are multiple credible implementation choices, include them in `decision_options`, recommend one in `recommended_option`, and explain why in `recommended_option_reason`.
+    - Do not ignore or contradict the latest human follow-up comment when it explicitly authorizes a bounded implementation path.
     - Do not broaden scope into unrelated refactors.
 
   discovery: |

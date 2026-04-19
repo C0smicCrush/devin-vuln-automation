@@ -41,6 +41,25 @@ class PollerTests(unittest.TestCase):
         }
         self.assertTrue(_session_changed(current, previous))
 
+    def test_session_changed_ignores_provisional_structured_output_while_running(self) -> None:
+        current = {
+            "status": "running",
+            "status_detail": "working",
+            "pull_requests": [],
+            "structured_output": {
+                "summary": "In progress: reproducing the bug",
+                "result": "manual_review",
+                "questions_for_human": ["Should I proceed?"],
+            },
+        }
+        previous = {
+            "status": "running",
+            "status_detail": "working",
+            "pull_requests": [],
+            "structured_output": {},
+        }
+        self.assertFalse(_session_changed(current, previous))
+
     def test_session_changed_true_when_questions_change(self) -> None:
         current = {
             "status": "running",
@@ -148,6 +167,28 @@ class PollerTests(unittest.TestCase):
         self.assertEqual(rollups["human_comment_followups_total"], 1)
         self.assertEqual(rollups["verification_sessions_total"], 2)
         self.assertEqual(rollups["verification_verdict_counts"]["verified"], 2)
+
+    def test_issue_rollups_ignore_provisional_questions_while_running(self) -> None:
+        sessions = [
+            {
+                "phase": "remediation",
+                "issue_number": 84,
+                "session_id": "rem-active",
+                "status": "running",
+                "status_detail": "working",
+                "pull_requests": [],
+                "structured_output": {
+                    "summary": "In progress",
+                    "questions_for_human": ["Should I proceed?"],
+                    "blocked_reason": "Need confirmation",
+                },
+                "tags": ["issue:84"],
+            }
+        ]
+        rollups = _build_issue_rollups(sessions)
+        self.assertEqual(rollups["tracked_items_total"], 1)
+        self.assertEqual(rollups["tracked_items_needing_human_followup"], 0)
+        self.assertFalse(rollups["issue_rollups"][0]["human_info_requested"])
 
 
 if __name__ == "__main__":

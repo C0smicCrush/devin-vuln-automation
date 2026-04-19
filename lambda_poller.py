@@ -42,38 +42,50 @@ def _save_snapshot(snapshot: dict) -> None:
     json_dump(snapshot_path("poller_snapshot.json"), snapshot)
 
 
+def _structured_output_is_final(session: dict) -> bool:
+    status = session.get("status")
+    status_detail = session.get("status_detail")
+    return status in {"exit", "error", "suspended", "waiting_for_user"} or status_detail == "waiting_for_user"
+
+
+def _effective_structured_output(session: dict) -> dict:
+    if not _structured_output_is_final(session):
+        return {}
+    return session.get("structured_output") or {}
+
+
 def _structured_summary(session: dict) -> str:
-    structured = session.get("structured_output") or {}
+    structured = _effective_structured_output(session)
     return structured.get("summary") or ""
 
 
 def _structured_verdict(session: dict) -> str:
-    structured = session.get("structured_output") or {}
+    structured = _effective_structured_output(session)
     return structured.get("verdict") or ""
 
 
 def _structured_blocked_reason(session: dict) -> str:
-    structured = session.get("structured_output") or {}
+    structured = _effective_structured_output(session)
     return structured.get("blocked_reason") or ""
 
 
 def _structured_questions(session: dict) -> list[str]:
-    structured = session.get("structured_output") or {}
+    structured = _effective_structured_output(session)
     return list(structured.get("questions_for_human") or [])
 
 
 def _structured_decision_options(session: dict) -> list[str]:
-    structured = session.get("structured_output") or {}
+    structured = _effective_structured_output(session)
     return list(structured.get("decision_options") or [])
 
 
 def _structured_recommended_option(session: dict) -> str:
-    structured = session.get("structured_output") or {}
+    structured = _effective_structured_output(session)
     return structured.get("recommended_option") or ""
 
 
 def _structured_recommended_option_reason(session: dict) -> str:
-    structured = session.get("structured_output") or {}
+    structured = _effective_structured_output(session)
     return structured.get("recommended_option_reason") or ""
 
 
@@ -157,7 +169,7 @@ def _record_session_metrics(metrics: dict, session: dict, issue_number: int, pha
             "status": session["status"],
             "status_detail": session.get("status_detail"),
             "pull_requests": session.get("pull_requests", []),
-            "structured_output": session.get("structured_output"),
+            "structured_output": _effective_structured_output(session),
             "tags": session.get("tags", []),
         }
     )
@@ -193,7 +205,7 @@ def _build_issue_rollups(sessions: list[dict]) -> dict:
         )
         phase = session.get("phase")
         tags = session.get("tags") or []
-        structured = session.get("structured_output") or {}
+        structured = _effective_structured_output(session)
         if phase == "remediation":
             issue["remediation_sessions"] += 1
         elif phase == "verification":
@@ -205,7 +217,12 @@ def _build_issue_rollups(sessions: list[dict]) -> dict:
                 issue["verified"] = issue["verified"] or verdict == "verified"
                 if verdict in verdict_counts:
                     verdict_counts[verdict] += 1
-        if session.get("status_detail") == "waiting_for_user" or structured.get("blocked_reason") or structured.get("questions_for_human"):
+        if _structured_output_is_final(session) and (
+            session.get("status") == "waiting_for_user"
+            or session.get("status_detail") == "waiting_for_user"
+            or structured.get("blocked_reason")
+            or structured.get("questions_for_human")
+        ):
             issue["human_info_requested"] = True
         for tag in tags:
             if not tag.startswith("comment:"):
