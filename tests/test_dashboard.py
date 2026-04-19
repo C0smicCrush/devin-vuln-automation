@@ -7,10 +7,18 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from scripts import dashboard_server
 from scripts.dashboard_server import build_dashboard_payload
 
 
 class DashboardTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # The dashboard uses a module-level TTL cache keyed only on time, so
+        # back-to-back tests would otherwise see the first test's payload and
+        # never observe their own temp state/metrics.
+        dashboard_server._PAYLOAD_CACHE["value"] = None
+        dashboard_server._PAYLOAD_CACHE["expires_at"] = 0.0
+
     def test_build_dashboard_payload_reads_metrics_and_queue(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             state_dir = Path(temp_dir) / "state"
