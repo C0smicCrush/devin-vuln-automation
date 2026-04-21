@@ -18,8 +18,11 @@ graph LR
     Manual[Manual POST]
     Linear[Linear POST]
     Schedule[EventBridge schedule]
+    VulnTrigger["/vuln-trigger POST"]
     Discovery[Discovery Lambda]
+    DevinDiscover[Devin discovery session]
     Tracked[Tracked GitHub issue]
+    HumanIssue[Human-authored issue]
     LocalIntake[Local intake wrapper]
     Intake[Intake Lambda]
     Queue[SQS or local queue]
@@ -36,7 +39,10 @@ graph LR
     Linear --> LocalIntake
     LocalIntake --> Intake
     Schedule --> Discovery
-    Discovery --> Tracked
+    VulnTrigger --> Discovery
+    Discovery --> DevinDiscover
+    DevinDiscover -- "opens issue itself" --> Tracked
+    HumanIssue -- "or file it yourself" --> Tracked
     Tracked --> Intake
     Intake --> Queue
     Queue --> Worker
@@ -50,7 +56,7 @@ graph LR
     Verify --> Dashboard
 ```
 
-In plain English: work can start from GitHub, a manual or Linear-style POST, or a scheduled discovery run. Everything ends up in the same intake and queue, the worker hands it to Devin, GitHub gets updated, and the poller plus dashboard show what happened.
+In plain English: work can start from GitHub, a manual/Linear POST, a scheduled discovery run, or an on-demand `/vuln-trigger`. The discovery lambda doesn't file issues itself — it hands the session to Devin, and **the Devin discovery session either opens the tracked GitHub issue itself or you file one directly**. From the tracked issue onward, every path flows through the same intake → queue → worker → remediation Devin → poller → verification loop, with GitHub as the artifact surface and the dashboard as the observability surface.
 
 ## Goals
 
