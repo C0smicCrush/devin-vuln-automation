@@ -14,7 +14,8 @@ Discovery is posture-d as a security researcher reading source code, not as a wr
 
 ```mermaid
 graph LR
-    GitHub[GitHub issue or comment]
+    Human[Human in GitHub]
+    Comment[GitHub comment]
     Manual[Manual POST]
     Linear[Linear POST]
     Schedule[EventBridge schedule]
@@ -22,7 +23,6 @@ graph LR
     Discovery[Discovery Lambda]
     DevinDiscover[Devin discovery session]
     Tracked[Tracked GitHub issue]
-    HumanIssue[Human-authored issue]
     LocalIntake[Local intake wrapper]
     Intake[Intake Lambda]
     Queue[SQS or local queue]
@@ -34,15 +34,15 @@ graph LR
     Verify[Verification]
     Dashboard[Dashboard and metrics]
 
-    GitHub --> Intake
-    Manual --> LocalIntake
-    Linear --> LocalIntake
-    LocalIntake --> Intake
     Schedule --> Discovery
     VulnTrigger --> Discovery
     Discovery --> DevinDiscover
     DevinDiscover -- "opens issue itself" --> Tracked
-    HumanIssue -- "or file it yourself" --> Tracked
+    Human -- "or files it directly" --> Tracked
+    Comment --> Intake
+    Manual --> LocalIntake
+    Linear --> LocalIntake
+    LocalIntake --> Intake
     Tracked --> Intake
     Intake --> Queue
     Queue --> Worker
@@ -56,7 +56,7 @@ graph LR
     Verify --> Dashboard
 ```
 
-In plain English: work can start from GitHub, a manual/Linear POST, a scheduled discovery run, or an on-demand `/vuln-trigger`. The discovery lambda doesn't file issues itself — it hands the session to Devin, and **the Devin discovery session either opens the tracked GitHub issue itself or you file one directly**. From the tracked issue onward, every path flows through the same intake → queue → worker → remediation Devin → poller → verification loop, with GitHub as the artifact surface and the dashboard as the observability surface.
+In plain English: work reaches the same Tracked GitHub issue two ways — the scheduled or on-demand discovery path where a Devin session opens the issue itself, or a human filing it directly on GitHub. From there, every path flows through the same intake → queue → worker → remediation Devin → poller → verification loop. Manual/Linear POSTs and GitHub comments are additional ingress signals on existing tracked issues.
 
 ## Goals
 
