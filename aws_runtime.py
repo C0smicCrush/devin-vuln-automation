@@ -15,6 +15,7 @@ from typing import Any
 import boto3
 
 from common import (
+    HttpStatusError,
     build_remediation_prompt_from_work_item,
     build_verification_prompt,
     canonical_issue_body_from_work_item,
@@ -614,25 +615,51 @@ def ensure_tracking_issue(settings: dict[str, Any], work_item: dict[str, Any]) -
 
 
 def post_issue_comment_once(settings: dict[str, Any], issue_number: int, body: str) -> bool:
+    """Post a comment on an issue/PR unless an identical one is already there.
+
+    Tolerates the issue/PR being gone: if GitHub returns 404 (not found) or 410 (deleted),
+    we log and return False instead of crashing. Without this, a single stale `issue:N` tag
+    on a long-lived Devin session whose tracking issue a human later deleted would take the
+    entire poller tick down, preventing any comments anywhere (including verdict landings on
+    unrelated PRs). Other HTTP errors still propagate — auth failures, rate limits, and
+    validation errors are real and should be loud."""
     owner = settings["owner"]
     repo = settings["repo"]
     token = settings["gh_token"]
-    existing_comments = github_request(
-        "GET",
-        f"/repos/{owner}/{repo}/issues/{issue_number}/comments",
-        token=token,
-        query={"per_page": "100"},
-    )
+    try:
+        existing_comments = github_request(
+            "GET",
+            f"/repos/{owner}/{repo}/issues/{issue_number}/comments",
+            token=token,
+            query={"per_page": "100"},
+        )
+    except HttpStatusError as exc:
+        if exc.status_code in (404, 410):
+            print(
+                f"post_issue_comment_once: skipping issue/PR #{issue_number} "
+                f"({exc.status_code} {owner}/{repo}); the target no longer exists."
+            )
+            return False
+        raise
     normalized_body = (body or "").strip()
     for comment in reversed(existing_comments):
         if (comment.get("body") or "").strip() == normalized_body:
             return False
-    github_request(
-        "POST",
-        f"/repos/{owner}/{repo}/issues/{issue_number}/comments",
-        token=token,
-        payload={"body": body},
-    )
+    try:
+        github_request(
+            "POST",
+            f"/repos/{owner}/{repo}/issues/{issue_number}/comments",
+            token=token,
+            payload={"body": body},
+        )
+    except HttpStatusError as exc:
+        if exc.status_code in (404, 410):
+            print(
+                f"post_issue_comment_once: target #{issue_number} disappeared between list "
+                f"and post ({exc.status_code} {owner}/{repo}); giving up on this comment."
+            )
+            return False
+        raise
     return True
 
 

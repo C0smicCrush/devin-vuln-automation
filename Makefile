@@ -1,6 +1,6 @@
 PYTHON ?= python3
 
-.PHONY: discover-devin deploy-aws terraform-build terraform-render terraform-import test invoke-manual invoke-linear docker-up docker-down docker-test docker-logs docker-smoke docker-discover
+.PHONY: discover-devin deploy-aws terraform-build terraform-render terraform-import test invoke-manual invoke-linear invoke-vuln-trigger docker-up docker-down docker-test docker-logs docker-smoke docker-discover docker-vuln-trigger
 
 discover-devin:
 	$(PYTHON) scripts/run_devin_discovery.py
@@ -44,3 +44,9 @@ invoke-manual:
 
 invoke-linear:
 	curl -sS -X POST "$$INTAKE_URL/linear" -H "Content-Type: application/json" --data @fixtures/linear.sample.json
+
+invoke-vuln-trigger:
+	curl -sS -X POST "$$INTAKE_URL/vuln-trigger" -H "Content-Type: application/json" --data @fixtures/vuln_trigger.sample.json
+
+docker-vuln-trigger:
+	curl -sS -X POST "http://localhost:$${LOCAL_INTAKE_PORT:-8000}/vuln-trigger" -H "Content-Type: application/json" --data @fixtures/vuln_trigger.sample.json

@@ -107,38 +107,101 @@ prompts:
     - Do not broaden scope into unrelated refactors.
 
   discovery: |
-    You are performing a bounded discovery review for `$owner/$repo`.
+    You are performing a bounded vulnerability hunt in `$owner/$repo`. You are acting as a security researcher reading the application source, not as a post-processor of scanner output.
 
     Repository to inspect: $repo_clone_url
 
     Goal:
-    - Find at most $max_findings actionable security or vulnerability remediation candidates.
+    - Find at most $max_findings real, code-grounded security vulnerabilities in this repository that a skilled attacker could exploit against a running instance of this application.
 
-    Requirements:
-    1. Only report findings that are strongly supported by repository evidence or deterministic dependency/security evidence (scanner output, pinned-vulnerable versions, advisory IDs, etc.).
-    2. Prefer concrete dependency vulnerabilities, unsafe configuration, or clearly actionable security flaws over speculative concerns.
-    3. Validate that each accepted finding is real enough to justify creating a tracked GitHub issue in this repository.
-    4. Prefer one advisory or CVE per finding so downstream remediation PRs stay bounded. Only aggregate multiple advisories into one finding if they share a single package bump with no other surface.
-    5. If you are not confident a finding is real and actionable, do not include it in `findings`. Instead, record it in `rejected_findings` with a short, concrete reason.
-    6. Keep the accepted list short and high signal. Returning zero accepted findings is acceptable.
+    What counts as in-scope:
+    - Missing or broken authentication and authorization checks on sensitive endpoints or actions (including IDOR).
+    - Injection sinks: SQL, NoSQL, command, shell (`shell=True`, unsafe `subprocess`, backticks), template, LDAP, XPath, header, log.
+    - Server-side request forgery (SSRF), including via URL-driven fetches, webhooks, image/file proxies, and redirect chains.
+    - Path traversal, arbitrary file read/write, unsafe archive extraction.
+    - Unsafe deserialization (`pickle`, `yaml.load`, `Marshal`, Java deserialization, etc.).
+    - Cross-site scripting (stored, reflected, DOM) via identifiable sinks, including unsafe `dangerouslySetInnerHTML`, template auto-escape bypasses, and unescaped interpolation into HTML.
+    - CSRF gaps on state-changing endpoints that rely on cookie auth.
+    - Open redirects, host header injection, overly permissive CORS (especially `*` with credentials), and unsafe `postMessage` handlers.
+    - Secrets committed to the repository (API keys, tokens, private keys, credentials in fixtures/configs that aren't placeholders).
+    - Broken or weak cryptography: home-grown crypto, MD5/SHA1 for security purposes, static IVs/salts, insecure random for tokens, weak JWT verification (alg=none, unverified signatures, missing audience/issuer checks), missing constant-time compares on secrets.
+    - Unsafe `eval`/`exec`/`Function(...)` on user-controlled input.
+    - Mass assignment / over-posting.
+    - Unsafe file upload handling (missing content-type validation, unsafe filenames, no sandboxing).
+    - Insecure defaults in auth/session/cookie config (missing `HttpOnly`, `Secure`, `SameSite`; long-lived or non-rotating sessions; password hashes with weak algorithms or low cost factors).
+    - Race conditions on auth or state transitions where exploitation is realistic.
+    - Known-vulnerable dependencies **only when** the vulnerable code path is actually reached from this repository's own code or a realistic runtime surface. A raw `npm audit` or `pip-audit` hit with no evidence of a reachable call site in this repo is NOT an accepted finding on its own — log it in `rejected_findings` with reason `no_reachable_call_site` along with the advisory ID and the package name.
 
-    For each accepted finding you include:
-    - Provide a concise title and problem statement.
-    - State the evidence and why it is actionable in this repository.
-    - Suggest the smallest safe remediation scope.
-    - Choose an initial scope tier and automation decision.
-    - Provide a narrow validation plan.
-    - Include labels that would make sense on a tracked GitHub issue.
+    What is explicitly out of scope (reject these):
+    - Pure code-style, lint, or maintainability concerns.
+    - Generic "this library is old" observations with no concrete vulnerable usage.
+    - Theoretical issues with no identifiable sink, source, or reachable data flow.
+    - Defense-in-depth hardening suggestions that don't correspond to an exploitable flaw today.
+    - Findings you could only describe in general terms ("authorization might be weak somewhere"); if you can't point at specific code, reject it.
+
+    How to work:
+    1. Orient yourself in the repository. Identify the application type (web backend, frontend, CLI, SDK, worker, etc.), framework, auth model, data stores, and external-facing entry points. Prefer reading routers/controllers, middleware, auth/session code, template rendering, database access, subprocess usage, file I/O, URL fetching code, and any code that handles secrets.
+    2. **Run dependency audits as a required first step.** Before you start reading code in depth, detect every ecosystem manifest present in the repo and run the matching audit command for each one. This is non-optional. The concrete rules are:
+       - If `package.json` / `package-lock.json` / `yarn.lock` / `pnpm-lock.yaml` is present, run the appropriate `npm audit --json` (or `yarn audit --json` / `pnpm audit --json`). Prefer whichever lockfile is actually present. Run it scoped to the lockfile's directory.
+       - If `requirements*.txt`, `pyproject.toml`, `Pipfile.lock`, or `poetry.lock` is present, run `pip-audit -r <file>` (for requirements files) or `pip-audit` / `pip-audit --strict` (for PEP 621 / Poetry / Pipenv projects, selecting the flag that matches).
+       - If both are present, run both. If neither is present, state that explicitly and move on — do not invent scans, do not install toolchains that aren't already in the sandbox.
+       - If a specific audit command is unavailable in the sandbox (missing binary, network-locked, lockfile version incompatible), state the exact command you tried, the error, and why you could not run it. Do not silently skip.
+       - Record each audit command in the `summary` output field as a short receipt block, e.g. `npm audit (superset-frontend): exit 1, 4 advisories -> GHSA-xxxx, GHSA-yyyy; pip-audit (-r requirements/base.txt): exit 0, 0 advisories`. This is mandatory: the summary must show which audits you ran, even if they returned zero advisories. A hunt with no audit receipts in `summary` is a failure mode and should never happen in a repository that has at least one recognizable ecosystem manifest.
+       Use the results as prioritization signal for step 3 and as corroborating evidence for any dependency-class finding, but remember: a scanner hit is not a finding. It becomes a finding only if step 3 locates the vulnerable call site in this repository's own code and confirms it is reachable. Any scanner hit you chose NOT to promote must appear in `rejected_findings` with its advisory ID, package name, and a short reason (typically `no_reachable_call_site`).
+    3. Form hypotheses like an attacker: "If I could control X, could I reach Y?" Then go verify or falsify each hypothesis against actual source. For each package flagged by the audits in step 2, explicitly go look for imports and call sites of that package in this repo and decide whether the vulnerable surface is reachable.
+    4. For each candidate finding, before accepting it, answer in your own head: "Where is the untrusted input? Where is the dangerous sink? What is the data flow between them? What validation or sanitization exists along that path, and why is it insufficient?" If you can't answer all four, it does not go in `findings`.
+    5. Prefer one vulnerability per finding so downstream remediation PRs stay bounded. Do not combine unrelated classes of issues into a single umbrella finding.
+    6. If you are not confident a finding is real and exploitable against this repository, do not include it in `findings`. Instead, record it in `rejected_findings` with a short, concrete reason.
+    7. Keep the accepted list short and high signal. Zero accepted findings is an acceptable outcome and is far better than speculative findings.
+
+    Evidence bar (required for each accepted finding):
+    - `evidence` MUST contain: (a) the specific file path(s) and line number(s) of the source (untrusted input) and the sink (dangerous operation), (b) a concrete one-paragraph data flow from source to sink showing why the existing controls are insufficient, and (c) a concrete exploitation sketch — the shape of input or request that would trigger the issue. Quote short snippets of the actual vulnerable code inline so a reviewer can verify without the session open.
+    - For findings that correspond to a dependency advisory, `evidence` MUST additionally include the exact audit command that surfaced it (e.g. `npm audit --json` output line), the advisory ID (GHSA / CVE), the package name and vulnerable version range, AND the repo-local import or call site you located that makes the advisory reachable here. A finding that cites an advisory but not a reachable call site in this repository is not acceptable — reject it with reason `no_reachable_call_site` instead.
+    - If you consulted a scanner for a non-dependency finding, record the exact command and the relevant line(s) of its output as supporting context at the end of `evidence`, but the code-level evidence above is still what justifies the finding.
+    - `likely_touched_files` MUST list the actual vulnerable file(s) you cited in `evidence`.
+    - `problem_statement` should read like a vulnerability report: what the flaw is, where it lives, why it is exploitable, and the impact class (RCE, auth bypass, data disclosure, etc.).
+    - Choose `confidence` honestly: `high` only when you have verified source, sink, and data flow in the actual code; `medium` when one leg of the triangle is inferred; do not submit `low` confidence findings — reject them instead.
+    - `scope_tier` and `automation_decision` should reflect how autonomously a remediation PR can proceed. Most real application-level vulnerabilities will be `tier1_auto_targeted_runtime` or `tier2_manual_review`, not `tier0`.
+    - `test_plan.commands` should include the narrowest reproducer you can describe (targeted curl/unit test/repro script), not just "run the full test suite." For UI/XSS findings, describe the exact payload and the page or component that renders it.
+    - `issue_labels` should include `security-remediation` and a class label (e.g. `vuln:authz`, `vuln:ssrf`, `vuln:xss`, `vuln:injection`, `vuln:deserialization`, `vuln:secrets`, `vuln:crypto`, `vuln:path-traversal`, `vuln:csrf`, `vuln:open-redirect`).
+
+    Self-service issue creation (you own this step — the control plane will NOT file issues for you):
+    For every finding that meets the evidence bar above, you are responsible for opening the tracked GitHub issue yourself on `$owner/$repo`, using the GitHub access available through your configured GitHub integration (the same access you use to clone and read the repo). Do not defer issue creation to the caller. The pipeline treats the issue you open as the canonical handoff to the remediation worker, so nothing happens downstream until that issue exists.
+
+    Do this, in order, before you finish the session:
+    1. Compute `finding_slug` = a short, lowercased, hyphen-separated slug derived from the finding's `id` (e.g. `SR-2024-THEME-XSS-01` → `sr-2024-theme-xss-01`). This slug is the dedupe key.
+    2. Dedupe against open issues. Call `GET /repos/$owner/$repo/issues?state=open&per_page=100` and inspect the returned issues. If any open issue either (a) has a label equal to `finding:<finding_slug>` or (b) has the exact same title you would use for this finding, do NOT file a duplicate. Instead set `issue_creation_status` = `duplicate_skipped` on the finding, populate `issue_url` and `issue_number` with the existing issue's values, and move on.
+    3. Ensure the repo has the labels you plan to apply. For each label in the set below that does not already exist on the repo, create it with `POST /repos/$owner/$repo/labels`. Required labels to use on every accepted finding:
+       - `security-remediation` (color `d73a4a`, description `Security remediation work item`)
+       - `devin-remediate` (color `0e8a16`, description `Trigger Devin remediation from this finding`)
+       - `devin-discovered` (color `5319e7`, description `Created from a bounded Devin discovery run`)
+       - `finding:<finding_slug>` (color `1d76db`, description `Dedupe key for a specific Devin discovery finding`)
+       - A `vuln:<class>` label matching the finding's class (`vuln:xss`, `vuln:ssrf`, `vuln:authz`, `vuln:injection`, `vuln:deserialization`, `vuln:secrets`, `vuln:crypto`, `vuln:path-traversal`, `vuln:csrf`, `vuln:open-redirect`). Use color `1d76db` and a short description. Missing labels silently disappear when the issue is created, so verify each one exists first.
+    4. Draft the issue body in markdown with the following sections, in this order, so the downstream remediation session gets a predictable shape:
+       - `## Problem Statement` — the contents of `problem_statement` verbatim.
+       - `## Discovery Evidence` — the contents of the finding's `evidence` field, including the inline code snippets and exploitation sketch.
+       - `## Likely Touched Files` — a bulleted list of the files in `likely_touched_files`, each in backticks.
+       - `## Suggested Validation` — a bulleted list of `test_plan.commands`, each in backticks.
+       - `## Scope Tier` — the finding's `scope_tier`, `automation_decision`, and `confidence` as a short metadata block.
+       - `## Discovery Notes` — a bullet list that includes: a link to this Devin session, a note that the remediation session must re-validate before making code changes, and a note that the remediation PR must include before/after scanner receipts and narrow test commands.
+    5. File the issue with `POST /repos/$owner/$repo/issues`, using the finding's `title` field as the title, the body drafted in step 4, and the full label set from step 3.
+    6. On success, set `issue_creation_status` = `opened` on the finding, and populate `issue_url` (the `html_url` from the GitHub response) and `issue_number` (the `number` from the GitHub response).
+    7. On failure (auth denied, API error, rate limit, validation error), do NOT pretend success. Set `issue_creation_status` = `failed` and put a short, specific reason in the finding's `issue_creation_error` field (e.g. `HTTP 403 insufficient permissions`, `HTTP 422 invalid label`, `network error: timeout`). Leave `issue_url` and `issue_number` unset. Keep the finding in `findings` — the control plane will still surface it to the reviewer.
+    8. If you cannot open issues at all for environmental reasons (e.g. the GitHub integration for this session has no write scope on `$owner/$repo`), say so explicitly once in `summary` with the exact error text, and use `issue_creation_status` = `failed` on every accepted finding with the same short reason. Do not silently drop findings.
+
+    You are the only actor that files issues from this hunt. There is no fallback issue-creation loop on the caller side. A finding in `findings` with no `issue_creation_status` is a bug and will be treated as a failed run.
 
     For each rejected finding you considered but discarded:
-    - Record the advisory ID or short title.
-    - Explain in one or two sentences why it is not actionable here (false positive, unused code path, upstream-only advisory, too-large bump, already fixed, etc.).
-    - This audit trail is part of the deliverable; an empty `rejected_findings` list is acceptable only if nothing was considered and rejected.
+    - Record a short title or identifier.
+    - Explain in one or two sentences why it is not actionable here. Useful reasons: `no_reachable_call_site`, `input_is_trusted`, `already_sanitized_upstream`, `defense_in_depth_only`, `speculative_no_evidence`, `lint_or_style_only`, `out_of_scope_for_this_repo`.
+    - Every advisory returned by the step-2 audits that you did NOT promote to `findings` MUST appear here, with its advisory ID (GHSA / CVE), package name, and the reason — typically `no_reachable_call_site`, `already_fixed`, or `upstream_dependency_not_used_by_this_repo`. Do not silently drop advisories.
+    - This audit trail is part of the deliverable. An empty `rejected_findings` list is only acceptable if both: (a) you genuinely considered nothing code-level worth discarding, and (b) the step-2 audits returned zero advisories across every detected ecosystem.
 
     Important constraints:
-    - Do not propose broad refactors.
-    - Do not include hypothetical or weakly supported issues in `findings`.
-    - Prefer fewer, higher-confidence findings over many marginal ones.
+    - Do not propose broad refactors or architectural rewrites.
+    - Do not include hypothetical, theoretical, or weakly supported issues in `findings`.
+    - Do not treat dependency advisories as findings on their own — they belong in `rejected_findings` unless you can cite the reachable vulnerable call site in this repository.
+    - Prefer fewer, higher-confidence, code-grounded findings over many marginal ones.
 
   verification: |
     You are a strict post-PR verification reviewer for `$owner/$repo`.

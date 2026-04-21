@@ -197,7 +197,56 @@ class CommonPromptTests(unittest.TestCase):
             1,
         )
         self.assertIn("rejected_findings", prompt)
-        self.assertIn("one advisory or CVE per finding", prompt)
+        self.assertIn("one vulnerability per finding", prompt)
+
+    def test_discovery_prompt_is_code_grounded_and_treats_scanners_as_context(self) -> None:
+        prompt = build_discovery_prompt(
+            "C0smicCrush",
+            "superset-remediation",
+            "https://github.com/C0smicCrush/superset-remediation",
+            1,
+        )
+        self.assertIn("security researcher", prompt)
+        self.assertIn("code-grounded", prompt)
+        self.assertIn("file path(s) and line number(s)", prompt)
+        self.assertIn("data flow", prompt)
+        self.assertIn("no_reachable_call_site", prompt)
+
+    def test_discovery_prompt_requires_dependency_audits_as_first_step(self) -> None:
+        prompt = build_discovery_prompt(
+            "C0smicCrush",
+            "superset-remediation",
+            "https://github.com/C0smicCrush/superset-remediation",
+            1,
+        )
+        self.assertIn("Run dependency audits as a required first step", prompt)
+        self.assertIn("non-optional", prompt)
+        self.assertIn("npm audit", prompt)
+        self.assertIn("pip-audit", prompt)
+        self.assertIn("record each audit command in the `summary`", prompt.lower())
+        self.assertIn("reachable call site", prompt)
+        self.assertIn("advisory ID", prompt)
+
+    def test_discovery_prompt_requires_devin_to_open_issues_itself(self) -> None:
+        prompt = build_discovery_prompt(
+            "C0smicCrush",
+            "superset-remediation",
+            "https://github.com/C0smicCrush/superset-remediation",
+            1,
+        )
+        self.assertIn("Self-service issue creation", prompt)
+        self.assertIn("the control plane will NOT file issues for you", prompt)
+        self.assertIn("GET /repos/C0smicCrush/superset-remediation/issues?state=open", prompt)
+        self.assertIn("POST /repos/C0smicCrush/superset-remediation/issues", prompt)
+        self.assertIn("POST /repos/C0smicCrush/superset-remediation/labels", prompt)
+        self.assertIn("finding:<finding_slug>", prompt)
+        self.assertIn("issue_creation_status", prompt)
+        self.assertIn("duplicate_skipped", prompt)
+        self.assertIn("issue_creation_error", prompt)
+        self.assertIn("security-remediation", prompt)
+        self.assertIn("devin-remediate", prompt)
+        self.assertIn("devin-discovered", prompt)
+        self.assertIn("do NOT pretend success", prompt)
 
     def test_discovery_schema_supports_rejected_findings(self) -> None:
         schema = discovery_output_schema()
@@ -207,6 +256,19 @@ class CommonPromptTests(unittest.TestCase):
         required_item_keys = schema["properties"]["rejected_findings"]["items"]["required"]
         self.assertIn("title", required_item_keys)
         self.assertIn("reason", required_item_keys)
+
+    def test_discovery_schema_captures_devin_issue_creation_fields(self) -> None:
+        schema = discovery_output_schema()
+        finding_item = schema["properties"]["findings"]["items"]
+        props = finding_item["properties"]
+        for key in ("issue_creation_status", "issue_url", "issue_number", "issue_creation_error"):
+            self.assertIn(key, props)
+        self.assertEqual(
+            set(props["issue_creation_status"]["enum"]),
+            {"opened", "duplicate_skipped", "failed"},
+        )
+        self.assertIn("issue_creation_status", finding_item["required"])
+        self.assertEqual(props["issue_number"]["type"], "integer")
 
     def test_seed_work_item_from_raw_uses_tier_defaults(self) -> None:
         raw = {

@@ -2,11 +2,9 @@ from __future__ import annotations
 
 from scripts.common import build_discovery_prompt, devin_request, discovery_output_schema, slugify, utc_now
 from scripts.run_devin_discovery import (
-    create_issue_from_finding,
-    existing_open_issues,
     has_active_discovery_session as local_has_active_discovery_session,
     poll_session_until_terminal,
-    should_create_issue,
+    summarize_issue_creation,
 )
 
 from aws_runtime import acquire_discovery_lock, has_active_discovery_session, load_runtime_settings, release_discovery_lock
@@ -18,7 +16,6 @@ def _launch_discovery_session(settings: dict, max_findings: int) -> dict:
         "prompt": build_discovery_prompt(settings["owner"], settings["repo"], settings["repo_url"], max_findings),
         "advanced_mode": "analyze",
         "repos": [settings["repo_url"]],
-        "max_acu_limit": 1,
         "structured_output_schema": discovery_output_schema(),
         "tags": [
             "project:devin-vuln-automation",
@@ -58,36 +55,7 @@ def handler(event, context):  # noqa: ANN001
         structured = final_session.get("structured_output") or {"summary": "", "findings": []}
         findings = structured.get("findings", [])
         rejected = structured.get("rejected_findings") or []
-        open_issues = existing_open_issues(settings["owner"], settings["repo"], settings["gh_token"])
-
-        created = []
-        skipped = []
-        for finding in findings[:max_findings]:
-            if finding.get("automation_decision") not in {"auto", "manual_approval", "auto-create-issue"}:
-                skipped.append({"id": finding["id"], "reason": "unsupported_automation_decision"})
-                continue
-            if str(finding.get("confidence", "")).lower() not in {"high", "medium"}:
-                skipped.append({"id": finding["id"], "reason": "low_confidence"})
-                continue
-            if not should_create_issue(open_issues, finding):
-                skipped.append({"id": finding["id"], "reason": "duplicate_open_issue"})
-                continue
-            issue = create_issue_from_finding(
-                settings["owner"],
-                settings["repo"],
-                settings["gh_token"],
-                finding,
-                session["url"],
-            )
-            created.append(
-                {
-                    "finding_id": finding["id"],
-                    "issue_number": issue["number"],
-                    "issue_url": issue["html_url"],
-                    "issue_title": issue["title"],
-                }
-            )
-            open_issues.append(issue)
+        buckets = summarize_issue_creation(findings)
 
         return {
             "action": "completed",
@@ -97,9 +65,10 @@ def handler(event, context):  # noqa: ANN001
             "status": final_session["status"],
             "summary": structured.get("summary", ""),
             "findings_count": len(findings),
-            "issues_created": len(created),
-            "created": created,
-            "skipped": skipped,
+            "issues_opened_by_devin": buckets["opened"],
+            "issues_skipped_as_duplicate": buckets["duplicate_skipped"],
+            "issue_creation_failures": buckets["failed"],
+            "findings_missing_issue_status": buckets["missing"],
             "rejected_findings": rejected,
         }
     finally:

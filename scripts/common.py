@@ -52,6 +52,27 @@ def compact_json(payload: Any) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
+class HttpStatusError(SystemExit):
+    """Raised by `http_json` on any HTTP error response.
+
+    Subclasses SystemExit for backwards-compatibility with the historical behavior (un-caught
+    HTTP errors terminate the local scripts/lambdas loudly). New callers that want to tolerate
+    specific status codes (e.g. 404/410 on a deleted GitHub issue) can catch `HttpStatusError`
+    and branch on `.status_code` instead of pattern-matching the message string.
+
+    Note: catching `Exception` will NOT catch this — it only inherits BaseException via
+    SystemExit — which is intentional. Code that doesn't explicitly opt into tolerating HTTP
+    errors keeps the old crash-loudly behavior.
+    """
+
+    def __init__(self, method: str, url: str, status_code: int, response_body: str) -> None:
+        self.method = method.upper()
+        self.url = url
+        self.status_code = status_code
+        self.response_body = response_body
+        super().__init__(f"{self.method} {url} failed: {status_code} {response_body}")
+
+
 def http_json(
     method: str,
     url: str,
@@ -74,7 +95,7 @@ def http_json(
             return json.loads(body)
     except error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
-        raise SystemExit(f"{method.upper()} {url} failed: {exc.code} {body}") from exc
+        raise HttpStatusError(method, url, exc.code, body) from exc
 
 
 def github_request(
@@ -634,6 +655,13 @@ def discovery_output_schema() -> dict[str, Any]:
                                 "requires_new_tests",
                             ],
                         },
+                        "issue_creation_status": {
+                            "type": "string",
+                            "enum": ["opened", "duplicate_skipped", "failed"],
+                        },
+                        "issue_url": {"type": "string"},
+                        "issue_number": {"type": "integer"},
+                        "issue_creation_error": {"type": "string"},
                     },
                     "required": [
                         "id",
@@ -645,6 +673,7 @@ def discovery_output_schema() -> dict[str, Any]:
                         "automation_decision",
                         "issue_labels",
                         "test_plan",
+                        "issue_creation_status",
                     ],
                 },
             },
